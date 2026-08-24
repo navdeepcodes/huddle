@@ -1,26 +1,220 @@
 @import "tailwindcss";
 
+/*
+ * Huddle is dark-forward by default (a coding workspace, not a marketing
+ * site) - these are the real default values, not an override. Light mode
+ * (prefers-color-scheme: light) overrides back below.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg-base: #0a0a0b;
+  --bg-raised: #131316;
+  --bg-overlay: #1c1c21;
+  --border: #232328;
+  --border-strong: #333339;
+  --fg: #f4f4f5;
+  --fg-muted: #a1a1aa;
+  --fg-subtle: #6b6b74;
+  --accent: #22d3ee;
+  --accent-fg: #05191c;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --danger: #f87171;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-bg-base: var(--bg-base);
+  --color-bg-raised: var(--bg-raised);
+  --color-bg-overlay: var(--bg-overlay);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --bg-base: #ffffff;
+    --bg-raised: #f7f7f8;
+    --bg-overlay: #ffffff;
+    --border: #e4e4e7;
+    --border-strong: #d4d4d8;
+    --fg: #18181b;
+    --fg-muted: #52525b;
+    --fg-subtle: #a1a1aa;
+    --accent: #0891b2;
+    --accent-fg: #ffffff;
+    --success: #16a34a;
+    --warning: #d97706;
+    --danger: #dc2626;
   }
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg-base);
+  color: var(--fg);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+* {
+  border-color: var(--border);
+}
+
+/*
+ * Phase 30: the shared motion vocabulary for the premium agent/preview
+ * experience - two durations and one easing curve, reused everywhere
+ * rather than each component picking its own timing. Deliberately
+ * restrained (see huddle-* keyframes below): opacity, small scale,
+ * small translation, shimmer - nothing that spins, bounces, or
+ * gradients. CSS-first by design (no animation library is installed -
+ * see package.json - and none is warranted for this).
+ */
+:root {
+  --dur-fast: 150ms;
+  --dur: 250ms;
+  --dur-slow: 400ms;
+  --ease-huddle: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/*
+ * Phase 31: the design-system gap the codebase actually had wasn't
+ * colors or motion (both already existed and were used consistently) -
+ * it was two things: (1) every micro-label below Tailwind's own
+ * text-xs floor (12px) was a one-off text-[10px]/text-[11px], never the
+ * same value twice; (2) no panel header row shared a height, so the
+ * file-explorer filter bar, the code/preview mode strip, and (once
+ * added) the activity/chat header rows each landed at a different
+ * pixel height and the vertical seams between side-by-side panels
+ * didn't line up. Both fixed here, additively - nothing existing is
+ * renamed or removed. Radius and elevation are deliberately NOT given
+ * new tokens: Tailwind's own rounded/rounded-md/rounded-lg scale and
+ * the existing --bg-base/--bg-raised/--bg-overlay trio already form a
+ * real scale, they just needed a documented convention, not a parallel
+ * one. Convention (apply going forward): rounded-md for controls
+ * (buttons/inputs/tabs), rounded-lg for panel-level containers and
+ * popovers, rounded-full for dots/pills/avatars; bg-base for the page
+ * ground, bg-raised for panel surfaces/row-hover/input fill,
+ * bg-overlay for anything that floats above the layout (popovers,
+ * modals, dropdowns).
+ */
+:root {
+  --panel-header-h: 2.25rem; /* 36px - shared height for every secondary panel header row */
+}
+
+/* Plain @theme (not inline): a static size with no light/dark variation, so it can be a build-time constant like Tailwind's own text-xs/text-sm rather than a live var() indirection. */
+@theme {
+  --text-2xs: 0.6875rem; /* 11px - the one real gap below text-xs; replaces the five different text-[Npx] one-offs */
+  --text-2xs--line-height: 1rem;
+}
+
+.huddle-panel-header {
+  height: var(--panel-header-h);
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+@keyframes huddle-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@keyframes huddle-shimmer {
+  0% { background-position: -140% 0; }
+  100% { background-position: 140% 0; }
+}
+
+@keyframes huddle-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes huddle-rise-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes huddle-scan {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.huddle-animate-pulse {
+  animation: huddle-pulse 1.8s ease-in-out infinite;
+}
+
+.huddle-animate-shimmer {
+  background-image: linear-gradient(
+    100deg,
+    transparent 30%,
+    color-mix(in srgb, var(--fg) 8%, transparent) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: huddle-shimmer 2.2s ease-in-out infinite;
+}
+
+.huddle-animate-fade-in {
+  animation: huddle-fade-in var(--dur-slow) var(--ease-huddle) both;
+}
+
+.huddle-animate-rise-in {
+  animation: huddle-rise-in var(--dur) var(--ease-huddle) both;
+}
+
+.huddle-animate-scan {
+  animation: huddle-scan 1.6s ease-in-out infinite;
+}
+
+/* Every animation above degrades to a static, still frame - never a hard "nothing moves" cliff that leaves a half-finished-looking layout, and never a flag any component has to check itself. */
+@media (prefers-reduced-motion: reduce) {
+  .huddle-animate-pulse,
+  .huddle-animate-shimmer,
+  .huddle-animate-fade-in,
+  .huddle-animate-rise-in,
+  .huddle-animate-scan,
+  .huddle-animate-sheet-in {
+    animation: none;
+  }
+  .huddle-animate-shimmer {
+    background-image: none;
+  }
+}
+
+/*
+ * Phase 32: mobile companion motion + surface additions - same
+ * restrained vocabulary as Phase 30's set above (one duration/ease
+ * pair, nothing that spins/bounces/gradients-everywhere), extended
+ * only where the mobile screens genuinely need something desktop
+ * never did: a sheet that enters from its own anchor edge (bottom),
+ * and exactly one soft accent glow used sparingly (empty states, the
+ * project-creation moment) rather than a decorative default.
+ */
+@keyframes huddle-sheet-in {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.huddle-animate-sheet-in {
+  animation: huddle-sheet-in var(--dur-slow) var(--ease-huddle) both;
+}
+
+.huddle-glow {
+  background: radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%);
+}
+
+/* Real device safe-area values (see layout.tsx's viewport-fit=cover) with a sane minimum so content never presses flush against a screen edge even on non-notched devices. */
+.huddle-safe-bottom {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.huddle-safe-top {
+  padding-top: max(0.75rem, env(safe-area-inset-top));
 }

@@ -1,0 +1,248 @@
+rules_version = '2';
+
+// ============================================================
+// Huddle - Firestore Security Rules
+// ============================================================
+//
+// This project (apostle-e3c23) is shared with the old "apostle" repo,
+// which is now frozen as legacy reference - see that repo's own
+// firestore.rules for full context on its collections. Everything
+// below the "Legacy apostle collections" marker is copied VERBATIM
+// from that file and must not be edited here: deploying rules from
+// this repo replaces the entire ruleset for the shared project, so
+// removing or narrowing any of those blocks would break the old
+// app's still-deployed client reads. Only the "Huddle collections"
+// block above that marker is this repo's own.
+//
+// SCOPE: protects CLIENT-DIRECT Firestore access only. The Firebase
+// Admin SDK (every app/api/* route) bypasses these rules entirely -
+// that's where this app's real authorization logic lives.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --------------------------------------------------------
+    // Helpers
+    // --------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isSessionMember(sessionId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/sessions/$(sessionId)) &&
+        request.auth.uid in get(/databases/$(database)/documents/sessions/$(sessionId)).data.memberIds;
+    }
+
+    // --------------------------------------------------------
+    // Huddle collections (this repo)
+    //
+    // Every write goes through an Admin-SDK API route (session
+    // creation, agent loop, runtime-host claim/heartbeat/report) -
+    // client code only ever subscribes for realtime reads, matching
+    // the ownership boundary from the approved architecture ("server
+    // owns Firestore as source of truth").
+    // --------------------------------------------------------
+
+    match /sessions/{sessionId} {
+      allow read: if isSignedIn() && request.auth.uid in resource.data.memberIds;
+      allow write: if false;
+    }
+
+    match /sessionFiles/{fileId} {
+      allow read: if isSessionMember(resource.data.sessionId);
+      allow write: if false;
+    }
+
+    match /runtimeHost/{sessionId} {
+      allow read: if isSessionMember(sessionId);
+      allow write: if false;
+    }
+
+    match /agentTurns/{sessionId} {
+      allow read: if isSessionMember(sessionId);
+      allow write: if false;
+    }
+
+    match /runtimeCommands/{commandId} {
+      allow read: if isSessionMember(resource.data.sessionId);
+      allow write: if false;
+    }
+
+    // Note: Phase 24 added two more Huddle collections (checkpoints,
+    // sessionPresence) but deliberately does NOT give them client-direct
+    // read rules here - both are read through Admin-SDK GET routes
+    // instead (checkpointStore.ts / presenceStore.ts), specifically to
+    // avoid a Firestore rules deploy to this shared production project
+    // (also serving the legacy apostle app) for this pass. They fall
+    // through to the deny-by-default catch-all below, which is correct:
+    // no client code attempts a direct read against them.
+
+    // Phase 29: userCredentials holds each user's encrypted Nemotron
+    // API key (lib/credentials/credentialStore.ts, Admin-SDK only,
+    // never read/written by client code). Same reasoning as above -
+    // no rules deploy for this pass, the deny-by-default catch-all
+    // already fully denies client access. This explicit block is
+    // documentation, matching the legacy codespaceRuntimeHostSecrets
+    // collection's own explicit-deny precedent below - if this file is
+    // ever deployed for another reason, uncomment it so the intent is
+    // enforced explicitly rather than only implicitly.
+    // match /userCredentials/{docId} {
+    //   allow read, write: if false;
+    // }
+
+    // ==========================================================
+    // Legacy apostle collections (copied verbatim - do not edit here)
+    // ==========================================================
+
+    function membershipDocId(uid, projectId) {
+      return uid + '_' + projectId;
+    }
+
+    function isProjectMember(projectId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/projectMemberships/$(membershipDocId(request.auth.uid, projectId)));
+    }
+
+    function isProjectCreator(projectId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/projects/$(projectId)) &&
+        get(/databases/$(database)/documents/projects/$(projectId)).data.createdBy == request.auth.uid;
+    }
+
+    match /projects/{projectId} {
+      allow create: if isSignedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 200
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 2000;
+
+      allow read: if false;
+
+      allow update, delete: if false;
+    }
+
+    match /projectMemberships/{membershipId} {
+      allow create, update: if isSignedIn()
+        && membershipId == membershipDocId(request.auth.uid, request.resource.data.projectId)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.role == 'owner'
+        && isProjectCreator(request.resource.data.projectId);
+
+      allow read, delete: if false;
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /messages/{messageId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /knowledge/{knowledgeId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /artifacts/{artifactId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /teamMessages/{messageId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /timelineEvents/{eventId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /codespaceFiles/{docId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /codespaceYjsUpdates/{docId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /codespacePresence/{docId} {
+      allow read: if isProjectMember(resource.data.projectId);
+      allow write: if false;
+    }
+
+    match /codespaceRuntimeHost/{projectId} {
+      allow read: if isProjectMember(projectId);
+      allow write: if false;
+    }
+
+    match /codespaceRuntimeHostSecrets/{projectId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /codespaceChatTurns/{projectId} {
+      allow read: if isProjectMember(projectId);
+      allow write: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isSelf(resource.data.recipientId);
+      allow write: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+
+      allow create: if isSelf(uid)
+        && request.resource.data.uid == uid;
+
+      allow update: if isSelf(uid)
+        && request.resource.data.uid == uid;
+
+      allow delete: if false;
+    }
+
+    match /workspaces/{workspaceId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /workspaceMemberships/{membershipId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /workspaceInvites/{code} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /workspaceIntegrations/{connectionId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /members/{memberId} {
+      allow read, create, update, delete: if false;
+    }
+
+    // --------------------------------------------------------
+    // Deny-by-default: any collection not explicitly matched
+    // above (including any not yet built) gets zero client
+    // access, rather than silently inheriting an open default.
+    // --------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
