@@ -13,15 +13,15 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
  * network calls - this is what "the provider receives key A" can
  * actually mean without hitting NVIDIA's real API in a test suite.
  */
-const constructedClients: Array<{ apiKey: string | undefined; instance: unknown }> = [];
+const constructedClients: Array<{ apiKey: string | undefined; maxRetries: number | undefined; instance: unknown }> = [];
 
 vi.mock("openai", () => {
   class FakeOpenAI {
     apiKey: string | undefined;
     chat: { completions: { create: ReturnType<typeof vi.fn> } };
-    constructor(opts: { apiKey?: string }) {
+    constructor(opts: { apiKey?: string; maxRetries?: number }) {
       this.apiKey = opts.apiKey;
-      constructedClients.push({ apiKey: opts.apiKey, instance: this });
+      constructedClients.push({ apiKey: opts.apiKey, maxRetries: opts.maxRetries, instance: this });
       this.chat = {
         completions: {
           create: vi.fn().mockImplementation(async () => ({
@@ -82,10 +82,16 @@ describe("Provider credential isolation (Phase 29 Part 9 - CRITICAL)", () => {
     await resolveAgentProviders("user-a");
     await resolveAgentProviders("user-b");
 
-    expect(constructedClients).toHaveLength(2);
-    expect(constructedClients[0].instance).not.toBe(constructedClients[1].instance);
-    expect(constructedClients[0].apiKey).toBe("nvapi-KEY-A");
-    expect(constructedClients[1].apiKey).toBe("nvapi-KEY-B");
+    // Phase 41C: each resolution now legitimately builds TWO clients
+    // (Ultra + Lightning fallback), both bound to that same user's key -
+    // 4 total, not 2. The security property under test is unchanged:
+    // no client built for A is ever the same instance as one built for B.
+    expect(constructedClients).toHaveLength(4);
+    const aClients = constructedClients.filter((c) => c.apiKey === "nvapi-KEY-A");
+    const bClients = constructedClients.filter((c) => c.apiKey === "nvapi-KEY-B");
+    expect(aClients).toHaveLength(2);
+    expect(bClients).toHaveLength(2);
+    for (const a of aClients) for (const b of bClients) expect(a.instance).not.toBe(b.instance);
   });
 
   it("CRITICAL: resolving providers for the same user twice in a row still uses that user's own key both times, never drifting to a stale or different value", async () => {
@@ -98,6 +104,22 @@ describe("Provider credential isolation (Phase 29 Part 9 - CRITICAL)", () => {
 
     expect(firstResult.message.content).toContain("nvapi-KEY-A");
     expect(secondResult.message.content).toContain("nvapi-KEY-A");
+  });
+
+  /**
+   * Phase 40B §E: retries have exactly one owner - generateStepWithRecovery's
+   * outer ladder (see providerRecovery.test.ts). The SDK client itself
+   * must stay at maxRetries: 0 forever, or the two ladders multiply
+   * again exactly as Phase 40 §9 found and removed.
+   */
+  it("E. the underlying OpenAI client is constructed with maxRetries: 0 - the SDK never retries on its own", async () => {
+    credentials.set("user-a", "nvapi-KEY-A");
+    await resolveAgentProviders("user-a");
+
+    // Phase 41C: two clients now (Ultra + Lightning) - both must hold
+    // this invariant, not just the primary.
+    expect(constructedClients).toHaveLength(2);
+    for (const c of constructedClients) expect(c.maxRetries).toBe(0);
   });
 
   it("a user with no personal key falls back to the platform credential, not another user's key", async () => {
@@ -116,6 +138,58 @@ describe("Provider credential isolation (Phase 29 Part 9 - CRITICAL)", () => {
     const { providers, nemotronSource } = await resolveAgentProviders("user-with-nothing");
     expect(nemotronSource).toBe("unavailable");
     expect(providers.find((p) => p.id === "nvidia")).toBeUndefined();
+  });
+
+  /**
+   * 2026-08-28: DeepSeek used to be appended here unconditionally as a
+   * fallback. Live evidence proved it could never succeed once
+   * Nemotron (thinking enabled) had produced reasoning - DeepSeek
+   * rejects the next request with `400 The reasoning_content in the
+   * thinking mode must be passed back to the API`, so the only thing
+   * the fallback ever did was replace Nemotron's real failure with a
+   * misleading DeepSeek one.
+   *
+   * Phase 41C: a real fallback IS registered again - Nemotron Lightning,
+   * not DeepSeek. Phase 41A benchmarked it directly against Ultra (9/9
+   * successful calls, dramatically lower latency) before this was added;
+   * a wider bake-off found no other NVIDIA free-endpoint candidate
+   * currently usable. This test now locks in "Ultra + Lightning, still
+   * never DeepSeek" instead of "Ultra alone."
+   */
+  it("registers Ultra + Lightning as the two providers - never DeepSeek", async () => {
+    credentials.set("user-a", "nvapi-KEY-A");
+    const { providers } = await resolveAgentProviders("user-a");
+    expect(providers.map((p) => p.id)).toEqual(["nvidia", "nvidia-lightning"]);
+    expect(providers.map((p) => p.id)).not.toContain("deepseek");
+  });
+
+  /**
+   * Phase 41C §6: Lightning must get a SMALLER attempt budget than
+   * Ultra's default (4) - "do not increase retry counts." Ultra keeps
+   * no explicit override (uses providerRecovery's own default), so this
+   * pins the one number that actually matters: Lightning's is 2, not 4
+   * and not unset.
+   */
+  it("Lightning is configured with the verified model id and a bounded 2-attempt budget, distinct from Ultra's default", async () => {
+    credentials.set("user-a", "nvapi-KEY-A");
+    const { providers } = await resolveAgentProviders("user-a");
+
+    const ultra = providers.find((p) => p.id === "nvidia")!;
+    const lightning = providers.find((p) => p.id === "nvidia-lightning")!;
+
+    expect(ultra.model).toBe("nvidia/nemotron-3-ultra-550b-a55b");
+    expect(ultra.maxAttempts).toBeUndefined(); // uses the shared default (4)
+
+    expect(lightning.model).toBe("nvidia/nemotron-3.5-lightning-30b-a3b");
+    expect(lightning.maxAttempts).toBe(2);
+  });
+
+  it("returns an EMPTY provider list when no Nemotron credential resolves - never a fallback that cannot work", async () => {
+    delete process.env.NVIDIA_API_KEY;
+    const { providers } = await resolveAgentProviders("user-with-nothing");
+    // The routes' own 422 ("No Nemotron API key is configured") keys off
+    // exactly this - an empty list, not a list containing a doomed provider.
+    expect(providers).toHaveLength(0);
   });
 });
 
@@ -145,7 +219,13 @@ describe("Provider retry stays on the same user's credential (Phase 29 Part 10 -
     expect(result.step.message.content).toContain("nvapi-KEY-A"); // the retry's actual response still came from A's client
     expect(result.attempts).toBe(2);
 
-    // The underlying OpenAI client itself was only ever constructed once for this resolution - the retry reused it, it didn't build a new one (let alone one bound to a different key).
-    expect(constructedClients.filter((c) => c.apiKey === "nvapi-KEY-A")).toHaveLength(1);
+    // The underlying OpenAI client itself was only ever constructed once
+    // PER PROVIDER for this resolution - the retry reused the Ultra
+    // client, it didn't build a new one (let alone one bound to a
+    // different key). Phase 41C: resolution now legitimately builds TWO
+    // clients for user A (Ultra + Lightning fallback), both bound to A's
+    // key - the invariant under test (no THIRD, no different key) still
+    // holds at length 2, not 1.
+    expect(constructedClients.filter((c) => c.apiKey === "nvapi-KEY-A")).toHaveLength(2);
   });
 });

@@ -234,3 +234,32 @@ describe("Phase 31: file mutations bump the owning session's updatedAt (dashboar
     expect((fake.store.get("s-activity-2") as { updatedAt: number }).updatedAt).toBeGreaterThan(1);
   });
 });
+
+describe("Phase 37: hasRealFiles - the sole 'is this a Project' signal", () => {
+  it("sets hasRealFiles true when a real (non-artifact) path is written", async () => {
+    fake.store.set("s-real", { id: "s-real", updatedAt: 1 });
+    await batchWriteSessionFiles("s-real", [{ path: "components/Header.js", content: "", updatedBy: "agent" }]);
+    expect((fake.store.get("s-real") as { hasRealFiles?: boolean }).hasRealFiles).toBe(true);
+  });
+
+  it("does NOT set hasRealFiles when only an artifact path is written", async () => {
+    fake.store.set("s-artifact", { id: "s-artifact", updatedAt: 1 });
+    await batchWriteSessionFiles("s-artifact", [{ path: "artifacts/hero-abc123.png", content: "", updatedBy: "agent", encoding: "base64" }]);
+    expect((fake.store.get("s-artifact") as { hasRealFiles?: boolean }).hasRealFiles).toBeUndefined();
+  });
+
+  it("sets hasRealFiles true when a batch mixes an artifact and a real file", async () => {
+    fake.store.set("s-mixed", { id: "s-mixed", updatedAt: 1 });
+    await batchWriteSessionFiles("s-mixed", [
+      { path: "artifacts/hero-abc123.png", content: "", updatedBy: "agent", encoding: "base64" },
+      { path: "pages/index.js", content: "", updatedBy: "agent" },
+    ]);
+    expect((fake.store.get("s-mixed") as { hasRealFiles?: boolean }).hasRealFiles).toBe(true);
+  });
+
+  it("stays true (one-way) even if a later batch only writes an artifact", async () => {
+    fake.store.set("s-oneway", { id: "s-oneway", updatedAt: 1, hasRealFiles: true });
+    await batchWriteSessionFiles("s-oneway", [{ path: "artifacts/deck-abc123.pptx", content: "", updatedBy: "agent", encoding: "base64" }]);
+    expect((fake.store.get("s-oneway") as { hasRealFiles?: boolean }).hasRealFiles).toBe(true);
+  });
+});

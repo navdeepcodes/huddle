@@ -167,3 +167,145 @@ describe("processWriteFileBatch", () => {
     expect(result.results).toHaveLength(12);
   });
 });
+
+/**
+ * Phase 39 (Batch 1 follow-up, "file explosion"/batching fix): a single
+ * write_file call can now describe multiple files via a `files` array,
+ * so the model can genuinely batch several known files into ONE tool
+ * call instead of relying on emitting several parallel tool_calls
+ * (which live evidence showed it essentially never does). This is the
+ * multi-file counterpart to the single-file suite above - the legacy
+ * `path`/`content` shape is untouched and still fully covered there.
+ */
+describe("processWriteFileBatch - multi-file 'files' array calls", () => {
+  it("persists every file from a single multi-file call, reported as one result", () => {
+    const result = processWriteFileBatch([
+      call("batch1", {
+        reason: "Create Header, Hero, and Footer together",
+        files: [
+          { path: "components/Header.js", content: "header" },
+          { path: "components/Hero.js", content: "hero" },
+          { path: "components/Footer.js", content: "footer" },
+        ],
+      }),
+    ]);
+
+    expect(result.toWrite).toEqual(
+      expect.arrayContaining([
+        { path: "components/Header.js", content: "header" },
+        { path: "components/Hero.js", content: "hero" },
+        { path: "components/Footer.js", content: "footer" },
+      ])
+    );
+    expect(result.toWrite).toHaveLength(3);
+    // Exactly ONE result for this ONE tool_call_id - the provider API
+    // requires exactly one tool message per tool_call, regardless of
+    // how many files it described.
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].ok).toBe(true);
+    expect(result.results[0].files).toHaveLength(3);
+    expect(result.results[0].files.every((f) => f.written)).toBe(true);
+    expect(result.results[0].message).toContain("Header.js");
+    expect(result.results[0].message).toContain("Hero.js");
+    expect(result.results[0].message).toContain("Footer.js");
+  });
+
+  it("a files array with even one malformed entry rejects the WHOLE call, not a partial batch", () => {
+    const result = processWriteFileBatch([
+      call("batch1", {
+        reason: "test",
+        files: [
+          { path: "a.js", content: "A" },
+          { content: "missing path entirely" },
+          { path: "c.js", content: "C" },
+        ],
+      }),
+    ]);
+
+    expect(result.toWrite).toHaveLength(0);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].ok).toBe(false);
+    expect(result.results[0].message).toContain("INVALID_TOOL_ARGUMENTS");
+    expect(result.results[0].files).toHaveLength(0);
+  });
+
+  it("rejects an empty files array with a clear message, not a silent no-op", () => {
+    const result = processWriteFileBatch([call("batch1", { reason: "test", files: [] })]);
+
+    expect(result.toWrite).toHaveLength(0);
+    expect(result.results[0].ok).toBe(false);
+    expect(result.results[0].message).toContain("INVALID_TOOL_ARGUMENTS");
+  });
+
+  it("mixes legacy single-file calls and new multi-file calls in the same step", () => {
+    const result = processWriteFileBatch([
+      call("single1", { path: "data/site.js", content: "site data" }),
+      call("batch1", {
+        reason: "components",
+        files: [
+          { path: "components/Header.js", content: "header" },
+          { path: "components/Hero.js", content: "hero" },
+        ],
+      }),
+    ]);
+
+    expect(result.toWrite).toHaveLength(3);
+    expect(result.results).toHaveLength(2);
+    expect(result.results.every((r) => r.ok)).toBe(true);
+  });
+
+  it("duplicate paths ACROSS a legacy call and a multi-file call in the same step: the later one wins, earlier is superseded (not an error)", () => {
+    const result = processWriteFileBatch([
+      call("single1", { path: "pages/index.js", content: "draft" }),
+      call("batch1", {
+        reason: "final version",
+        files: [{ path: "pages/index.js", content: "final" }, { path: "components/Nav.js", content: "nav" }],
+      }),
+    ]);
+
+    expect(result.toWrite).toEqual(
+      expect.arrayContaining([
+        { path: "pages/index.js", content: "final" },
+        { path: "components/Nav.js", content: "nav" },
+      ])
+    );
+    expect(result.toWrite).toHaveLength(2);
+
+    const single = result.results.find((r) => r.id === "single1");
+    expect(single?.ok).toBe(true); // superseded, not an error
+    expect(single?.message.toLowerCase()).toContain("superseded");
+
+    const batch = result.results.find((r) => r.id === "batch1");
+    expect(batch?.ok).toBe(true);
+    expect(batch?.files.find((f) => f.path === "pages/index.js")?.written).toBe(true);
+    expect(batch?.files.find((f) => f.path === "components/Nav.js")?.written).toBe(true);
+  });
+
+  it("duplicate paths WITHIN one multi-file call: the later entry wins, earlier is superseded within the same call", () => {
+    const result = processWriteFileBatch([
+      call("batch1", {
+        reason: "test",
+        files: [
+          { path: "a.js", content: "first draft" },
+          { path: "a.js", content: "second draft - final" },
+        ],
+      }),
+    ]);
+
+    expect(result.toWrite).toEqual([{ path: "a.js", content: "second draft - final" }]);
+    expect(result.results[0].ok).toBe(true);
+    const files = result.results[0].files;
+    expect(files[0]).toEqual({ path: "a.js", written: false });
+    expect(files[1]).toEqual({ path: "a.js", written: true });
+  });
+
+  it("never throws on a malformed files array (not an array, wrong entry types)", () => {
+    expect(() =>
+      processWriteFileBatch([
+        call("1", { files: "not an array" }),
+        call("2", { files: [null, 42, "string-not-object"] }),
+        call("3", { files: [{ path: 42, content: "x" }] }),
+      ])
+    ).not.toThrow();
+  });
+});

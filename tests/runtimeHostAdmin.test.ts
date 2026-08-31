@@ -30,11 +30,17 @@ function makeFakeAdminDb() {
       collection: () => ({
         doc: (id: string) => docRef(id),
       }),
-      runTransaction: async (fn: (tx: { get: (ref: ReturnType<typeof docRef>) => Promise<{ data: () => Record<string, unknown> | undefined }>; set: (ref: ReturnType<typeof docRef>, data: Record<string, unknown>) => void }) => Promise<unknown>) => {
+      // Phase 40: reportRuntimeHostState is transactional now (it needs
+      // to check ownership + generation and write atomically), so the
+      // fake transaction needs `update` alongside `get`/`set`.
+      runTransaction: async (fn: (tx: { get: (ref: ReturnType<typeof docRef>) => Promise<{ data: () => Record<string, unknown> | undefined }>; set: (ref: ReturnType<typeof docRef>, data: Record<string, unknown>) => void; update: (ref: ReturnType<typeof docRef>, data: Record<string, unknown>) => void }) => Promise<unknown>) => {
         const tx = {
           get: (ref: ReturnType<typeof docRef>) => ref.get(),
           set: (ref: ReturnType<typeof docRef>, data: Record<string, unknown>) => {
             void ref.set(data);
+          },
+          update: (ref: ReturnType<typeof docRef>, data: Record<string, unknown>) => {
+            void ref.update(data);
           },
         };
         return fn(tx);
@@ -148,5 +154,111 @@ describe("reportRuntimeHostState", () => {
     const ok = await reportRuntimeHostState("s1", "tabGhost", "installing");
     expect(ok).toBe(false);
     expect(fake.store.get("s1")?.state).toBe("starting"); // unchanged
+  });
+});
+
+/**
+ * Phase 40 §2/§4: runtime attempts now have identity. A reclaim of a
+ * genuinely-live runtime must not demote it, and a worker from a
+ * superseded attempt must not be able to overwrite newer state - which
+ * previously was prevented only by timing.
+ */
+describe("claimRuntimeHost - transition rules (Phase 40 §4)", () => {
+  it("a SAME-tab reclaim of a RUNNING runtime preserves state/port/previewUrl and does not advance the generation", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    await reportRuntimeHostState("s1", "tabA", "running", { port: 3000, previewUrl: "https://x" });
+    const generationBefore = fake.store.get("s1")?.generation;
+
+    const host = await claimRuntimeHost("s1", "tabA");
+
+    expect(host.state).toBe("running"); // NOT demoted to "starting"
+    expect(host.port).toBe(3000);
+    expect(host.previewUrl).toBe("https://x");
+    expect(host.generation).toBe(generationBefore);
+  });
+
+  it("a SAME-tab reclaim of a non-running runtime DOES start a new attempt and advances the generation", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    await reportRuntimeHostState("s1", "tabA", "crashed");
+    const generationBefore = fake.store.get("s1")?.generation as number;
+
+    const host = await claimRuntimeHost("s1", "tabA");
+
+    expect(host.state).toBe("starting");
+    expect(host.generation).toBe(generationBefore + 1);
+  });
+
+  it("a NEW tab claiming a stale host starts a new attempt and advances the generation", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      await claimRuntimeHost("s1", "tabA");
+      await reportRuntimeHostState("s1", "tabA", "running", { port: 3000 });
+      const generationBefore = fake.store.get("s1")?.generation as number;
+
+      vi.setSystemTime(RUNTIME_HOST_STALE_MS + 1);
+      const host = await claimRuntimeHost("s1", "tabB");
+
+      expect(host.ownerTabId).toBe("tabB");
+      expect(host.state).toBe("starting");
+      expect(host.port).toBeNull();
+      expect(host.generation).toBe(generationBefore + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a worker from the PREVIOUS generation cannot overwrite the new attempt's state", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    const staleGeneration = fake.store.get("s1")?.generation as number;
+
+    // A new attempt begins (e.g. the boot crashed and the tab re-claimed).
+    await reportRuntimeHostState("s1", "tabA", "crashed");
+    await claimRuntimeHost("s1", "tabA");
+    const currentGeneration = fake.store.get("s1")?.generation as number;
+    expect(currentGeneration).toBe(staleGeneration + 1);
+
+    // The OLD attempt's long-running watcher finally finishes and reports "running".
+    const applied = await reportRuntimeHostState("s1", "tabA", "running", {
+      port: 9999,
+      generation: staleGeneration,
+    });
+
+    expect(applied).toBe(false);
+    expect(fake.store.get("s1")?.state).toBe("starting"); // untouched by the stale worker
+    expect(fake.store.get("s1")?.port).toBeNull();
+  });
+
+  it("a worker from the CURRENT generation is applied normally", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    const generation = fake.store.get("s1")?.generation as number;
+
+    const applied = await reportRuntimeHostState("s1", "tabA", "running", { port: 3000, generation });
+
+    expect(applied).toBe(true);
+    expect(fake.store.get("s1")?.state).toBe("running");
+  });
+
+  it("a stale crash report cannot knock a newer, healthy runtime out of 'running'", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    const staleGeneration = fake.store.get("s1")?.generation as number;
+
+    await reportRuntimeHostState("s1", "tabA", "crashed");
+    await claimRuntimeHost("s1", "tabA"); // new attempt
+    const currentGeneration = fake.store.get("s1")?.generation as number;
+    await reportRuntimeHostState("s1", "tabA", "running", { port: 3000, generation: currentGeneration });
+
+    // The old attempt's crash watcher fires late.
+    const applied = await reportRuntimeHostState("s1", "tabA", "crashed", { generation: staleGeneration });
+
+    expect(applied).toBe(false);
+    expect(fake.store.get("s1")?.state).toBe("running");
+  });
+
+  it("a report with NO generation still works - legacy callers and pre-Phase-40 docs are unaffected", async () => {
+    await claimRuntimeHost("s1", "tabA");
+    const applied = await reportRuntimeHostState("s1", "tabA", "installing");
+    expect(applied).toBe(true);
+    expect(fake.store.get("s1")?.state).toBe("installing");
   });
 });

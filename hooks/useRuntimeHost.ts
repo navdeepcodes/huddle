@@ -80,8 +80,16 @@ export function useRuntimeHost(sessionId: string): RuntimeHost | null {
     let heartbeat: ReturnType<typeof setInterval> | null = null;
     let stopped = false;
 
+    /**
+     * Phase 40 §2: the generation this tab's runtime attempt is
+     * operating under, learned from the claim response. Every state
+     * report carries it so the server can discard reports from a
+     * superseded attempt (see reportRuntimeHostState).
+     */
+    let generation: number | undefined;
+
     async function report(
-      state: RuntimeHost["state"],
+      state: RuntimeHost["state"] | null,
       extra?: {
         port?: number | null;
         previewUrl?: string | null;
@@ -92,7 +100,7 @@ export function useRuntimeHost(sessionId: string): RuntimeHost | null {
       await authedFetch(`/api/sessions/${sessionId}/runtime-host/report`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tabId, state, ...extra }),
+        body: JSON.stringify({ tabId, state, generation, ...extra }),
       });
     }
 
@@ -100,8 +108,20 @@ export function useRuntimeHost(sessionId: string): RuntimeHost | null {
       onStateChange: (state: RuntimeHost["state"], extra?: Parameters<typeof report>[1]) => {
         void report(state, extra);
       },
+      /**
+       * Phase 40 §3: previewUrl and readiness are related but DISTINCT
+       * facts - knowing a URL is not evidence that the runtime answers
+       * on it. This used to report state "running" alongside the URL,
+       * which made it a fifth de-facto readiness authority requiring no
+       * evidence of its own. It now writes ONLY the URL (state: null),
+       * leaving readiness to the worker that actually proved it with a
+       * real in-container HTTP response. Passing a state here would
+       * also race the accompanying onStateChange - the two are separate
+       * HTTP calls with no ordering guarantee, so a "starting" could
+       * land after a "running" and demote a healthy runtime.
+       */
       onPreviewUrl: (url: string) => {
-        void report("running", { previewUrl: url });
+        void report(null, { previewUrl: url });
       },
     };
 
@@ -131,6 +151,18 @@ export function useRuntimeHost(sessionId: string): RuntimeHost | null {
         if (stopped) return;
 
         if (claimRes.ok) {
+          // Phase 40 §2: adopt the generation this claim established, so
+          // every subsequent readiness report can be matched against the
+          // current attempt. A failure to read it is non-fatal - an
+          // undefined generation simply falls back to ownership-only
+          // checking, i.e. exactly the pre-Phase-40 behavior.
+          try {
+            const claimed = (await claimRes.clone().json()) as { generation?: number };
+            generation = claimed.generation;
+          } catch {
+            generation = undefined;
+          }
+
           heartbeat = setInterval(() => {
             void authedFetch(`/api/sessions/${sessionId}/runtime-host/heartbeat`, {
               method: "POST",

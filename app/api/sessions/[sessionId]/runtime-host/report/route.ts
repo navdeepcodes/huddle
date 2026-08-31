@@ -17,18 +17,29 @@ export async function POST(request: NextRequest, { params }: Props) {
   }
 
   const body = await request.json();
-  const { tabId, state, port, previewUrl, errorMessage, startupTelemetry } = body as {
+  const { tabId, state, port, previewUrl, errorMessage, startupTelemetry, generation } = body as {
     tabId: string;
-    state: RuntimeState;
+    // Phase 40 §3: null = write the extras only (e.g. previewUrl) without moving the state machine.
+    state: RuntimeState | null;
     port?: number | null;
     previewUrl?: string | null;
     errorMessage?: string | null;
     startupTelemetry?: RuntimeStartupTelemetry;
+    // Phase 40 §2: the runtime attempt this report belongs to; a report from a superseded attempt is discarded.
+    generation?: number;
   };
 
-  const ok = await reportRuntimeHostState(sessionId, tabId, state, { port, previewUrl, errorMessage, startupTelemetry });
+  const ok = await reportRuntimeHostState(sessionId, tabId, state ?? null, {
+    port,
+    previewUrl,
+    errorMessage,
+    startupTelemetry,
+    generation,
+  });
   if (!ok) {
-    return NextResponse.json({ error: "Not the current runtime host." }, { status: 409 });
+    // Also covers a report from a superseded generation - correct to
+    // reject, and the client treats it as a no-op rather than an error.
+    return NextResponse.json({ error: "Not the current runtime host, or a superseded runtime attempt." }, { status: 409 });
   }
   return NextResponse.json({ success: true });
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { validateWriteFileArgs } from "@/lib/agent/validateWriteFile";
+import { validateWriteFileArgs, validateWriteFileCallArgs } from "@/lib/agent/validateWriteFile";
 
 describe("validateWriteFileArgs", () => {
   it("accepts a valid path and content", () => {
@@ -112,5 +112,111 @@ describe("validateWriteFileArgs", () => {
   it("normalizes a harmless leading ./ instead of rejecting it", () => {
     const result = validateWriteFileArgs({ path: "./src/App.tsx", content: "x" });
     expect(result).toEqual({ ok: true, value: { path: "src/App.tsx", content: "x" } });
+  });
+});
+
+/**
+ * Phase 39 (Batch 1 follow-up): validateWriteFileCallArgs is the new
+ * call-level entry point - it wraps the exact same single-file
+ * validator above (unchanged) for the legacy `path`/`content` shape,
+ * and adds the new `files` array shape for genuinely batching several
+ * files into one call.
+ */
+describe("validateWriteFileCallArgs", () => {
+  it("accepts the legacy single-file shape, wrapped as a one-element files array", () => {
+    const result = validateWriteFileCallArgs({ path: "src/App.tsx", content: "export default function App() {}" });
+    expect(result).toEqual({ ok: true, files: [{ path: "src/App.tsx", content: "export default function App() {}" }] });
+  });
+
+  it("accepts a multi-file 'files' array and validates every entry with the same rules as the single-file shape", () => {
+    const result = validateWriteFileCallArgs({
+      reason: "batch",
+      files: [
+        { path: "components/Header.js", content: "header" },
+        { path: "components/Hero.js", content: "hero" },
+      ],
+    });
+    expect(result).toEqual({
+      ok: true,
+      files: [
+        { path: "components/Header.js", content: "header" },
+        { path: "components/Hero.js", content: "hero" },
+      ],
+    });
+  });
+
+  it("normalizes a leading ./ within a files array entry, same as the single-file shape", () => {
+    const result = validateWriteFileCallArgs({ files: [{ path: "./src/App.tsx", content: "x" }] });
+    expect(result).toEqual({ ok: true, files: [{ path: "src/App.tsx", content: "x" }] });
+  });
+
+  it("rejects the whole call when 'files' is present but not an array, and not parseable as one either", () => {
+    const result = validateWriteFileCallArgs({ files: "not an array" });
+    expect(result.ok).toBe(false);
+  });
+
+  /**
+   * Live-confirmed (2026-08-26, the first real build under this
+   * feature): a model can double-encode `files` - emitting a JSON
+   * array serialized AGAIN into a string (`"files": "[{...}]"`)
+   * instead of a real array. Rather than reject a correctly-intended
+   * call over a common tool-calling serialization quirk, this is
+   * parsed defensively and treated as if the model had sent a real
+   * array.
+   */
+  it("recovers a double-encoded 'files' string (a JSON array serialized as a string) instead of rejecting it", () => {
+    const result = validateWriteFileCallArgs({
+      files: JSON.stringify([
+        { path: "components/Header.js", content: "header" },
+        { path: "components/Hero.js", content: "hero" },
+      ]),
+    });
+    expect(result).toEqual({
+      ok: true,
+      files: [
+        { path: "components/Header.js", content: "header" },
+        { path: "components/Hero.js", content: "hero" },
+      ],
+    });
+  });
+
+  it("still validates each entry's path/content normally after recovering a double-encoded files string", () => {
+    const result = validateWriteFileCallArgs({
+      files: JSON.stringify([{ path: "/etc/passwd", content: "x" }]),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain("absolute");
+  });
+
+  it("rejects an empty files array with a clear, actionable message", () => {
+    const result = validateWriteFileCallArgs({ files: [] });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain("at least one file");
+  });
+
+  it("rejects the WHOLE call when any one entry in files is invalid - not a partial acceptance", () => {
+    const result = validateWriteFileCallArgs({
+      files: [{ path: "a.js", content: "A" }, { path: "", content: "bad path" }, { path: "c.js", content: "C" }],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.field).toBe("path");
+  });
+
+  it("rejects an absolute path or a .. traversal inside a files array entry, same as the single-file shape", () => {
+    const abs = validateWriteFileCallArgs({ files: [{ path: "/etc/passwd", content: "x" }] });
+    expect(abs.ok).toBe(false);
+    const traversal = validateWriteFileCallArgs({ files: [{ path: "../escape", content: "x" }] });
+    expect(traversal.ok).toBe(false);
+  });
+
+  it("falls through to a clear error when neither 'path'/'content' nor 'files' is present", () => {
+    const result = validateWriteFileCallArgs({ reason: "nothing to write" });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects arguments that aren't an object at all", () => {
+    expect(validateWriteFileCallArgs("not an object").ok).toBe(false);
+    expect(validateWriteFileCallArgs(null).ok).toBe(false);
+    expect(validateWriteFileCallArgs(42).ok).toBe(false);
   });
 });

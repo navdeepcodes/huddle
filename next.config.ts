@@ -9,14 +9,16 @@ const nextConfig: NextConfig = {
   // resources - avatars, any future embedded preview - without
   // requiring them to opt in with Cross-Origin-Resource-Policy).
   async headers() {
+    const webContainerHeaders = [
+      { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+      { key: "Cross-Origin-Embedder-Policy", value: "credentialless" },
+    ];
     return [
-      {
-        source: "/session/:sessionId",
-        headers: [
-          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-          { key: "Cross-Origin-Embedder-Policy", value: "credentialless" },
-        ],
-      },
+      { source: "/session/:sessionId", headers: webContainerHeaders },
+      // Phase 38: the public "Let the World Try It" page also boots its
+      // own real WebContainer instance (see publicBoot.ts) - same
+      // SharedArrayBuffer requirement, same fix, just a second route.
+      { source: "/p/:sessionId", headers: webContainerHeaders },
     ];
   },
 };

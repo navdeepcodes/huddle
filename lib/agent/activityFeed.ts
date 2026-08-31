@@ -35,6 +35,8 @@ export type ActivityKind =
   | "inspecting_preview"
   | "reading"
   | "fixing_error"
+  | "presentation"
+  | "image"
   | "completed";
 
 export interface ActivityEntry {
@@ -61,6 +63,10 @@ function summarize(kind: ActivityKind, items: string[]): string {
       return "Updated the plan";
     case "fixing_error":
       return n === 1 ? `Hit an error: ${items[0]}` : `Hit ${n} errors while working`;
+    case "presentation":
+      return items[0] ?? "Presentation created";
+    case "image":
+      return items[0] ?? "Image created";
     case "completed":
       return items[0] ?? "Finished";
   }
@@ -77,7 +83,8 @@ function appendOrMerge(entries: ActivityEntry[], kind: ActivityKind, item: strin
   entries.push({ kind, summary: summarize(kind, [item]), detail: [item], ok, at });
 }
 
-const TERMINATION_LABEL: Partial<Record<NonNullable<TurnTerminationReason>, string>> = {
+/** Exported so completionSummary.ts can describe a finished turn the same way the activity feed's own final row does - one label per termination reason, not two independently-worded copies. */
+export const TERMINATION_LABEL: Partial<Record<NonNullable<TurnTerminationReason>, string>> = {
   done: "Completed",
   blocked: "Stopped - some work is blocked",
   cancelled: "Cancelled",
@@ -85,6 +92,10 @@ const TERMINATION_LABEL: Partial<Record<NonNullable<TurnTerminationReason>, stri
   truncated_no_action: "Stopped - ran out of response budget",
   internal_error: "Stopped - an internal error occurred",
   step_budget_exhausted: "Stopped - ran out of iteration budget",
+  evidence_incomplete: "Stopped - build or preview evidence is missing",
+  claim_expired: "Stopped - lost track of this turn (recovered after a restart)",
+  wall_clock_exhausted: "Stopped - reached this turn's time limit",
+  build_repair_budget_exhausted: "Stopped - the build kept failing after every allowed attempt",
 };
 
 export function buildActivityFeed(
@@ -119,6 +130,25 @@ export function buildActivityFeed(
         entries.push({
           kind: ok ? "inspecting_preview" : "fixing_error",
           summary: ok ? summarize("inspecting_preview", []) : `Preview check failed: ${msg.content ?? ""}`,
+          detail: [],
+          ok,
+          at: msg.createdAt,
+        });
+        break;
+      case "create_presentation":
+        entries.push({
+          kind: ok ? "presentation" : "fixing_error",
+          summary: msg.content ?? summarize("presentation", []),
+          detail: [],
+          ok,
+          at: msg.createdAt,
+        });
+        break;
+      case "create_image":
+      case "edit_image":
+        entries.push({
+          kind: ok ? "image" : "fixing_error",
+          summary: msg.content ?? summarize("image", []),
           detail: [],
           ok,
           at: msg.createdAt,
@@ -218,6 +248,31 @@ export function buildUnifiedFeed(
           entry: {
             kind: ok ? "inspecting_preview" : "fixing_error",
             summary: ok ? summarize("inspecting_preview", []) : `Preview check failed: ${msg.content ?? ""}`,
+            detail: [],
+            ok,
+            at: msg.createdAt,
+          },
+        });
+        break;
+      case "create_presentation":
+        items.push({
+          type: "activity",
+          entry: {
+            kind: ok ? "presentation" : "fixing_error",
+            summary: msg.content ?? summarize("presentation", []),
+            detail: [],
+            ok,
+            at: msg.createdAt,
+          },
+        });
+        break;
+      case "create_image":
+      case "edit_image":
+        items.push({
+          type: "activity",
+          entry: {
+            kind: ok ? "image" : "fixing_error",
+            summary: msg.content ?? summarize("image", []),
             detail: [],
             ok,
             at: msg.createdAt,

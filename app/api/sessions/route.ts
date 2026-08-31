@@ -4,6 +4,7 @@ import { getVerifiedUid } from "@/lib/auth/verifyRequest";
 import { adminDb } from "@/lib/firebase/admin";
 import { runAgentTurn } from "@/lib/agent/loop";
 import { resolveAgentProviders } from "@/lib/agent/providerResolution";
+import { claimTurnAuthoritative, TurnClaimError } from "@/lib/agent/turnRegistry";
 
 import type { Session } from "@/types/session";
 
@@ -46,7 +47,7 @@ export async function POST(request: NextRequest) {
   const { providers } = await resolveAgentProviders(uid);
   if (providers.length === 0) {
     return NextResponse.json(
-      { error: "No Nemotron API key is configured for your account, and no fallback provider is available." },
+      { error: "No Nemotron API key is configured for your account." },
       { status: 422 }
     );
   }
@@ -63,7 +64,21 @@ export async function POST(request: NextRequest) {
   };
   await ref.set(session);
 
-  runAgentTurn(session.id, message.trim(), uid, session.memberIds).catch((error) => {
+  // A freshly minted session id can never already have an active claim
+  // in practice, but claiming here anyway keeps the invariant uniform -
+  // every runAgentTurn call is backed by a real claim, regardless of
+  // which route started it (see turnRegistry.ts's claimTurnAuthoritative).
+  let turnToken: string;
+  try {
+    ({ turnToken } = await claimTurnAuthoritative(session.id));
+  } catch (error) {
+    if (error instanceof TurnClaimError) {
+      return NextResponse.json({ error: "A turn is already running for this session." }, { status: 409 });
+    }
+    throw error;
+  }
+
+  runAgentTurn(session.id, message.trim(), uid, turnToken, false, session.memberIds).catch((error) => {
     console.error(`Agent turn failed for session ${session.id}:`, error);
   });
 

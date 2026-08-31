@@ -59,18 +59,58 @@ const MODEL = process.env.NVIDIA_MODEL || "nvidia/nemotron-3-ultra-550b-a55b";
  * code path anywhere in this file that could send request A's
  * messages through a client built for a different key; the key is
  * captured once in the closure at creation and never overwritten.
+ *
+ * Phase 41C: also the Lightning fallback's provider. Lightning
+ * (nvidia/nemotron-3.5-lightning-30b-a3b) is served by the exact same
+ * NVIDIA endpoint, credential, and request shape as Ultra - Phase 41A's
+ * benchmark already proved this request shape (including
+ * chat_template_kwargs) works against it live, 9/9 calls. Per "reuse
+ * the existing NVIDIA-compatible client and request structure, do not
+ * duplicate the provider implementation, the only model-specific
+ * difference should be the model identifier/configuration" - this
+ * factory now takes an options object instead of being Ultra-only.
+ * Every existing call site that omits `options` gets IDENTICAL
+ * behavior to before this change (same id, same displayName, same
+ * MODEL constant, same default retry budget) - only providerResolution.ts's
+ * new second call site actually passes anything.
  */
-export function createNemotronProvider(apiKey: string): AgentModelProvider {
+export function createNemotronProvider(
+  apiKey: string,
+  options?: {
+    model?: string;
+    id?: string;
+    displayName?: string;
+    /** Phase 41C: e.g. 2 for Lightning - see provider.ts's own doc comment. */
+    maxAttempts?: number;
+  }
+): AgentModelProvider {
+  const model = options?.model ?? MODEL;
+  const id = options?.id ?? "nvidia";
+  const displayName = options?.displayName ?? "NVIDIA Nemotron 3 Ultra";
   const client = new OpenAI({
     apiKey,
     baseURL: "https://integrate.api.nvidia.com/v1",
-    maxRetries: 1,
+    // Phase 40 §9 / 40B: ONE retry owner. This used to be 1, sitting
+    // directly underneath generateStepWithRecovery's own bounded ladder
+    // (MAX_RETRIES_PER_PROVIDER = 2 -> 3 attempts), so a single logical
+    // step could make 3 x 2 = 6 HTTP attempts at up to 180s each ~= 18
+    // minutes for ONE iteration - which also silently exceeded
+    // TURN_CLAIM_STALE_MS (5 min) and could get a live turn reclaimed
+    // mid-flight. Retries are owned by providerRecovery.ts alone, same
+    // discipline qwenVision.ts and geminiImage.ts already follow.
+    // Worst case per iteration is now MAX_RETRIES_PER_PROVIDER's 4
+    // attempts x 180s = 12 min, still bounded further by the turn's
+    // wall-clock deadline - see providerRecovery.ts's doc comment for
+    // why 3 total attempts (Phase 40's first value) proved too little
+    // headroom against NVIDIA's observed intermittent 500s.
+    maxRetries: 0,
   });
 
   return {
-    id: "nvidia",
-    displayName: "NVIDIA Nemotron 3 Ultra",
-    model: MODEL,
+    id,
+    displayName,
+    model,
+    maxAttempts: options?.maxAttempts,
 
     async generateStep(
       messages: ChatCompletionMessageParam[],
@@ -80,11 +120,22 @@ export function createNemotronProvider(apiKey: string): AgentModelProvider {
       try {
         const completion = await client.chat.completions.create(
           {
-            model: MODEL,
+            model,
             temperature: 0.7,
             max_tokens: 8000,
             tools,
             tool_choice: "auto",
+            // Phase 40: explicit, not relying on whatever this endpoint's
+            // unstated default is - live evidence (2026-08-25, the
+            // Marginalia build) showed every write_file call arriving as
+            // its own separate turn even for components the model had
+            // already decided to write back-to-back, despite the prompt
+            // and write_file's own tool description both saying multiple
+            // files belong in one step. Setting this explicitly removes
+            // one possible cause; whether the model actually uses it once
+            // allowed is a separate, model-behavior question this alone
+            // can't guarantee.
+            parallel_tool_calls: true,
             messages,
             chat_template_kwargs: {
               enable_thinking: true,
@@ -100,9 +151,9 @@ export function createNemotronProvider(apiKey: string): AgentModelProvider {
 
         if (!choice) {
           throw new AgentProviderError(
-            "nvidia",
+            id,
             "malformed_response",
-            "NVIDIA Nemotron 3 Ultra returned no choices.",
+            `${displayName} returned no choices.`,
             true
           );
         }
@@ -126,9 +177,9 @@ export function createNemotronProvider(apiKey: string): AgentModelProvider {
         const { kind, retryable } = classifyAgentProviderFailure(error, signal);
 
         throw new AgentProviderError(
-          "nvidia",
+          id,
           kind,
-          `NVIDIA Nemotron 3 Ultra agent step failed: ${
+          `${displayName} agent step failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
           retryable,

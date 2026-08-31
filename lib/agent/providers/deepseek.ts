@@ -57,6 +57,9 @@ export const deepSeekAgentProvider: AgentModelProvider = {
           thinking: { type: "enabled" },
           tools,
           tool_choice: "auto",
+          // Phase 40: see nemotron.ts's identical comment - explicit
+          // rather than relying on an unstated default, same evidence.
+          parallel_tool_calls: true,
           messages,
         } as ChatCompletionCreateParamsNonStreaming & {
           thinking: { type: "enabled" };

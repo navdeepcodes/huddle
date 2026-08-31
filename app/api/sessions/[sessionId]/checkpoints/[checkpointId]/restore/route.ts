@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getVerifiedUid } from "@/lib/auth/verifyRequest";
 import { requireSessionMember } from "@/lib/auth/requireSessionMember";
 import { restoreCheckpoint } from "@/lib/checkpoints/checkpointStore";
-import { isTurnActive } from "@/lib/agent/turnRegistry";
+import { isTurnActiveAuthoritative } from "@/lib/agent/turnRegistry";
 
 interface Props {
   params: Promise<{ sessionId: string; checkpointId: string }>;
@@ -22,7 +22,7 @@ export async function POST(request: NextRequest, { params }: Props) {
     return NextResponse.json({ error: "Forbidden." }, { status: 403 });
   }
 
-  if (isTurnActive(sessionId)) {
+  if (await isTurnActiveAuthoritative(sessionId)) {
     return NextResponse.json({ error: "Cannot restore while the agent is working." }, { status: 409 });
   }
 

@@ -8,6 +8,7 @@ import { useAgentTurn } from "@/hooks/useAgentTurn";
 import { useRuntimeHost } from "@/hooks/useRuntimeHost";
 import { usePresence } from "@/hooks/usePresence";
 import { useCheckpoints } from "@/hooks/useCheckpoints";
+import { useArtifacts } from "@/hooks/useArtifacts";
 import { computeCurrentTurnChanges } from "@/lib/agent/changesSummary";
 
 import { WorkspaceHeader } from "@/components/workspace/WorkspaceHeader";
@@ -17,6 +18,7 @@ import { PreviewPane } from "@/components/workspace/PreviewPane";
 import { SplitView } from "@/components/workspace/SplitView";
 import { HuddlePanel } from "@/components/workspace/HuddlePanel";
 import { ChangesSummary } from "@/components/workspace/ChangesSummary";
+import { ProposalReviewBanner } from "@/components/workspace/ProposalReviewBanner";
 
 export function ProjectWorkspace({ sessionId }: { sessionId: string }) {
   const session = useSessionDoc(sessionId);
@@ -25,6 +27,7 @@ export function ProjectWorkspace({ sessionId }: { sessionId: string }) {
   const host = useRuntimeHost(sessionId);
   const presence = usePresence(sessionId);
   const { checkpoints, latestPaths, restore } = useCheckpoints(sessionId, turn?.active);
+  const { artifacts } = useArtifacts(sessionId, turn?.active);
 
   const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
@@ -94,7 +97,10 @@ export function ProjectWorkspace({ sessionId }: { sessionId: string }) {
         presence={presence}
         checkpoints={checkpoints}
         onRestoreCheckpoint={restore}
+        artifacts={artifacts}
       />
+
+      {session?.isProposal && <ProposalReviewBanner session={session} />}
 
       <div className="flex flex-1 overflow-hidden">
         <aside className="flex w-60 shrink-0 flex-col border-r border-border">
@@ -135,7 +141,7 @@ export function ProjectWorkspace({ sessionId }: { sessionId: string }) {
         </main>
 
         <aside className="flex w-80 shrink-0 flex-col border-l border-border">
-          <HuddlePanel sessionId={sessionId} session={session} turn={turn} host={host} />
+          <HuddlePanel sessionId={sessionId} session={session} turn={turn} host={host} checkpointPaths={latestPaths} />
         </aside>
       </div>
     </div>

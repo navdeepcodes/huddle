@@ -5,6 +5,9 @@ import { ArrowUp, MoreHorizontal, Settings, Sparkles } from "lucide-react";
 
 import { relativeTime } from "@/app/page";
 import { BottomSheet } from "@/components/mobile/BottomSheet";
+import { QuickResult } from "@/components/entry/QuickResult";
+import { classifyRequestIntent } from "@/lib/projects/classifyIntent";
+import { isProjectWorthy } from "@/lib/projects/isProjectWorthy";
 
 import type { Session } from "@/types/session";
 
@@ -15,6 +18,15 @@ interface Props {
   onArchive: (id: string) => Promise<boolean>;
 }
 
+/** Phase 37 STEP 6: same intent cues as desktop - prefills, never a template picker. */
+const PROJECT_STARTERS: Array<{ label: string; prefill: string }> = [
+  { label: "Website", prefill: "Build a website for " },
+  { label: "App", prefill: "Build an app that " },
+  { label: "Hackathon", prefill: "Let's build our hackathon project: " },
+  { label: "SaaS", prefill: "Build a SaaS product for " },
+  { label: "Game", prefill: "Build a game where " },
+];
+
 /**
  * Phase 32: the mobile companion's front door - "Home" says "Tell
  * Huddle what you want, watch it build, review what it made, and keep
@@ -23,24 +35,42 @@ interface Props {
  * creation surface). Shares useProjectList's data/create/archive logic
  * with the desktop dashboard via props from app/page.tsx - no second
  * fetch, no second Firestore query.
+ *
+ * Phase 37: "Tell Huddle what to build" assumed every interaction was
+ * a Project - now a quick question/image/presentation stays right here
+ * (QuickResult, inline) instead of hard-navigating away, and "Your
+ * projects" only ever shows sessions that actually became one
+ * (isProjectWorthy) - see Session.hasRealFiles's own doc comment.
  */
 export function MobileHome({ projects, onCreate, onNavigate, onArchive }: Props) {
   const [message, setMessage] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [quickSessionId, setQuickSessionId] = useState<string | null>(null);
 
   async function handleCreate() {
     if (!message.trim() || creating) return;
+    const text = message.trim();
     setCreating(true);
     setError(null);
-    const result = await onCreate(message.trim());
-    if (result.ok) {
-      onNavigate(result.id);
-    } else {
+    const result = await onCreate(text);
+    if (!result.ok) {
       setError(result.error);
       setCreating(false);
+      return;
     }
+
+    if (classifyRequestIntent(text) === "project") {
+      onNavigate(result.id);
+      return;
+    }
+    setMessage("");
+    setCreating(false);
+    setQuickSessionId(result.id);
   }
+
+  const projectList = projects?.filter(isProjectWorthy) ?? null;
+  const recentCreations = projects?.filter((p) => !isProjectWorthy(p)) ?? null;
 
   return (
     <div className="min-h-dvh bg-bg-base">
@@ -59,7 +89,7 @@ export function MobileHome({ projects, onCreate, onNavigate, onArchive }: Props)
         <div className="huddle-glow relative mt-4 shrink-0 overflow-hidden rounded-2xl border border-border bg-bg-raised p-4">
           <p className="mb-2.5 flex items-center gap-1.5 text-xs font-medium text-fg-subtle">
             <Sparkles className="h-3.5 w-3.5 text-accent" strokeWidth={2} />
-            What should Huddle build?
+            What do you want to make or explore?
           </p>
           <textarea
             rows={3}
@@ -68,34 +98,62 @@ export function MobileHome({ projects, onCreate, onNavigate, onArchive }: Props)
               setMessage(e.target.value);
               if (error) setError(null);
             }}
-            placeholder="A premium portfolio site for a photographer…"
+            placeholder="Ask a question, generate an image, or describe a project…"
             className="w-full resize-none bg-transparent text-base text-fg outline-none placeholder:text-fg-subtle"
           />
-          <div className="mt-1 flex items-center justify-between">
-            {error ? <p className="text-xs text-danger">{error}</p> : <span />}
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <div className="flex min-w-0 gap-1.5 overflow-x-auto">
+              {PROJECT_STARTERS.map((starter) => (
+                <button
+                  key={starter.label}
+                  onClick={() => setMessage(starter.prefill)}
+                  className="shrink-0 rounded-full border border-border px-2.5 py-1 text-xs text-fg-subtle active:bg-bg-overlay"
+                >
+                  {starter.label}
+                </button>
+              ))}
+            </div>
             <button
               onClick={handleCreate}
               disabled={!message.trim() || creating}
-              aria-label="Create project"
+              aria-label="Ask Huddle"
               className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-accent text-accent-fg transition-transform active:scale-95 disabled:opacity-40"
             >
               <ArrowUp className="h-5 w-5" strokeWidth={2.5} />
             </button>
           </div>
+          {error && <p className="mt-1.5 text-xs text-danger">{error}</p>}
         </div>
+
+        {quickSessionId && (
+          <div className="mt-4 shrink-0">
+            <QuickResult sessionId={quickSessionId} onContinueInWorkspace={onNavigate} onDismiss={() => setQuickSessionId(null)} />
+          </div>
+        )}
 
         <div className="mt-9 flex-1 pb-8">
           <p className="mb-3 text-xs font-medium uppercase tracking-wide text-fg-subtle">Your projects</p>
 
-          {projects === null ? (
+          {projectList === null ? (
             <ProjectCardSkeletonList />
-          ) : projects.length === 0 ? (
+          ) : projectList.length === 0 ? (
             <EmptyState />
           ) : (
             <div className="flex flex-col gap-3">
-              {projects.map((p) => (
+              {projectList.map((p) => (
                 <ProjectCard key={p.id} project={p} onOpen={() => onNavigate(p.id)} onArchive={() => onArchive(p.id)} />
               ))}
+            </div>
+          )}
+
+          {recentCreations !== null && recentCreations.length > 0 && (
+            <div className="mt-9">
+              <p className="mb-3 text-xs font-medium uppercase tracking-wide text-fg-subtle">Recent creations</p>
+              <div className="flex flex-col gap-3">
+                {recentCreations.map((p) => (
+                  <ProjectCard key={p.id} project={p} onOpen={() => onNavigate(p.id)} onArchive={() => onArchive(p.id)} />
+                ))}
+              </div>
             </div>
           )}
         </div>

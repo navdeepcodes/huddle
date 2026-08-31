@@ -4,6 +4,7 @@ import {
   startDevServer,
   pickDevScript,
   watchForRecovery,
+  continueWatchingForReadiness,
   quickReadinessCheck,
   canReuseBackgroundCommand,
 } from "@/lib/runtime/runtimeSession";
@@ -256,6 +257,104 @@ describe("watchForRecovery", () => {
     expect(previews).toEqual([{ url: "https://preview.example/", port: 5173 }]);
     // startDevServer itself never calls watchForRecovery - that's RuntimeSession's job,
     // gated on the wrapped callback's crashed flag, which the happy path never sets.
+  });
+});
+
+describe("continueWatchingForReadiness (Phase 41)", () => {
+  it("live-reproduced gap: a port that's still 'starting' after quickReadinessCheck gives up eventually promotes to running once curl succeeds - the state doc no longer freezes forever", async () => {
+    vi.useFakeTimers();
+    try {
+      let curlSucceeds = false;
+      const runtime = fakeRuntime({
+        getKnownPreviewPorts: vi.fn().mockReturnValue([3001]),
+        runForeground: vi.fn().mockImplementation(async () => {
+          return curlSucceeds
+            ? { exitCode: 0, output: "" }
+            : { exitCode: 2, output: "curl: connect ECONNREFUSED" };
+        }),
+        waitForPort: vi.fn().mockResolvedValue("https://preview.example/"),
+      });
+      const { callbacks, states, previews } = fakeCallbacks();
+
+      const done = continueWatchingForReadiness(runtime, 3001, () => false, callbacks);
+
+      // Same shape as the live case: several polls still see the server not answering yet.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(states).toEqual([]);
+
+      // The cold compile finishes; curl starts succeeding.
+      curlSucceeds = true;
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(await done).toBe(true);
+      expect(states).toEqual([{ state: "running", extra: { port: 3001 } }]);
+      expect(previews).toEqual([{ url: "https://preview.example/", port: 3001 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not promote a stale watch once a newer restart has superseded its port - a late-finishing watch shouldn't overwrite fresher state", async () => {
+    vi.useFakeTimers();
+    try {
+      let knownPorts = [3001];
+      const runtime = fakeRuntime({
+        getKnownPreviewPorts: vi.fn().mockImplementation(() => knownPorts),
+        runForeground: vi.fn().mockResolvedValue({ exitCode: 0, output: "" }),
+      });
+      const { callbacks, states } = fakeCallbacks();
+
+      const done = continueWatchingForReadiness(runtime, 3001, () => false, callbacks);
+      // Before this watch's own curl check resolves, a fresh restart moves the session to a new port.
+      knownPorts = [3002];
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(await done).toBe(false);
+      expect(states).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up after PORT_WAIT_MS if the server never starts answering - bounded, not an indefinite hang", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime({
+        getKnownPreviewPorts: vi.fn().mockReturnValue([3001]),
+        runForeground: vi.fn().mockResolvedValue({ exitCode: 2, output: "curl: connect ECONNREFUSED" }),
+      });
+      const { callbacks, states } = fakeCallbacks();
+
+      const done = continueWatchingForReadiness(runtime, 3001, () => false, callbacks);
+      await vi.advanceTimersByTimeAsync(91_000); // past PORT_WAIT_MS (90s)
+
+      expect(await done).toBe(false);
+      expect(states).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops immediately once isStopped reports true, mid-wait", async () => {
+    vi.useFakeTimers();
+    try {
+      let stopped = false;
+      const runtime = fakeRuntime({
+        getKnownPreviewPorts: vi.fn().mockReturnValue([3001]),
+        runForeground: vi.fn().mockResolvedValue({ exitCode: 2, output: "curl: connect ECONNREFUSED" }),
+      });
+      const { callbacks, states } = fakeCallbacks();
+
+      const done = continueWatchingForReadiness(runtime, 3001, () => stopped, callbacks);
+      await vi.advanceTimersByTimeAsync(2_000);
+      stopped = true;
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(await done).toBe(false);
+      expect(states).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

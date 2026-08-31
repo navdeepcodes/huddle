@@ -35,4 +35,33 @@ describe("normalizeShellCommand", () => {
     expect(normalizeShellCommand("npm install").command).toBe("npm install");
     expect(normalizeShellCommand("curl -s http://localhost:3000/").command).toBe("curl -s http://localhost:3000/");
   });
+
+  describe("process management commands - short-circuited, jsh has none of these (Phase 40)", () => {
+    it("short-circuits pkill", () => {
+      expect(normalizeShellCommand('pkill -f "next"').shortCircuitMessage).toBeDefined();
+    });
+
+    it("short-circuits lsof piped to kill", () => {
+      expect(normalizeShellCommand("lsof -ti:3001 | xargs kill -9").shortCircuitMessage).toBeDefined();
+    });
+
+    it("short-circuits pgrep and killall", () => {
+      expect(normalizeShellCommand("pgrep node").shortCircuitMessage).toBeDefined();
+      expect(normalizeShellCommand("killall node").shortCircuitMessage).toBeDefined();
+    });
+
+    it("short-circuits ps aux / ps -ef", () => {
+      expect(normalizeShellCommand("ps aux | grep next").shortCircuitMessage).toBeDefined();
+      expect(normalizeShellCommand("ps -ef | grep node").shortCircuitMessage).toBeDefined();
+    });
+
+    it("short-circuits kill $(...) command substitution", () => {
+      expect(normalizeShellCommand("kill $(cat server.pid)").shortCircuitMessage).toBeDefined();
+      expect(normalizeShellCommand("kill -9 $(cat server.pid)").shortCircuitMessage).toBeDefined();
+    });
+
+    it("does not short-circuit an unrelated command that merely contains the word 'kill' as part of something else", () => {
+      expect(normalizeShellCommand("npm run build").shortCircuitMessage).toBeUndefined();
+    });
+  });
 });

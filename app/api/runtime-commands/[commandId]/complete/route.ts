@@ -31,12 +31,37 @@ export async function POST(request: NextRequest, { params }: Props) {
   }
 
   const body = await request.json();
-  await commandRef.update({
-    status: body.status,
-    result: body.result ?? null,
-    errorMessage: body.errorMessage ?? null,
-    completedAt: Date.now(),
+
+  /**
+   * Phase 40 §5: one command, one lifecycle, one terminal state. The
+   * server can now abandon a timed-out command by writing a terminal
+   * `error` (see commandRelay.ts's reconcileOnTimeout). If the host tab
+   * then reports a late result for that same command, it must NOT
+   * silently overwrite the terminal state - the waiting caller has
+   * already been told it failed and has moved on, so resurrecting the
+   * doc would make a command look freshly successful long after its
+   * result could be used. Transactional so a late report and the
+   * abandonment can never interleave into a torn state.
+   *
+   * "started" is explicitly not terminal here: a background command
+   * legitimately reports started and then done.
+   */
+  const applied = await adminDb.runTransaction(async (tx) => {
+    const snap = await tx.get(commandRef);
+    const current = snap.data() as RuntimeCommand | undefined;
+    if (!current) return false;
+    if (current.status === "done" || current.status === "error") return false;
+
+    tx.update(commandRef, {
+      status: body.status,
+      result: body.result ?? null,
+      errorMessage: body.errorMessage ?? null,
+      completedAt: Date.now(),
+    });
+    return true;
   });
 
-  return NextResponse.json({ success: true });
+  // 200 either way: a late report is a normal, expected race, not a
+  // client error - but `applied` tells the caller what actually happened.
+  return NextResponse.json({ success: true, applied });
 }

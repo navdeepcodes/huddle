@@ -21,8 +21,22 @@ const CAPTURE_TIMEOUT_MS = 45_000;
  * signal) rather than reaching into port/curl internals directly - by
  * design, view_preview doesn't need to know anything about how
  * readiness is determined, only that it eventually is.
+ *
+ * Phase 40: live evidence (2026-08-25, the Marginalia build) - a real
+ * cold install+first-compile (15 freshly-written files, Tailwind v4
+ * JIT) outlasted the old 25s ceiling on FIVE consecutive view_preview
+ * calls in a row (each one restarting its own 25s window from zero),
+ * before a run_command curl proved the server had actually been
+ * answering for a while. That's five wasted full model round-trips -
+ * real wall-clock and real token cost - for the same wait a single
+ * more-patient call would have absorbed for free (this is server-side
+ * polling, not the model blocked mid-turn). Raised to 50s - still well
+ * under CAPTURE_TIMEOUT_MS's own 45s-plus-backoff precedent for "this
+ * environment has real run-to-run variance, budget for the slow case."
+ * This is the sanctioned "agent can waste steps waiting on
+ * runtime/preview readiness during cold-start" item, not new scope.
  */
-const STATE_READY_WAIT_MS = 25_000;
+const STATE_READY_WAIT_MS = 50_000;
 const STATE_POLL_INTERVAL_MS = 2_000;
 
 /**

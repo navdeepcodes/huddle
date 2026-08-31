@@ -18,11 +18,12 @@ vi.mock("@/lib/files/fileStore", () => ({
   readSessionFile: vi.fn(),
 }));
 
+const dispatchRuntimeCommand = vi.fn();
 vi.mock("@/lib/runtime/commandRelay", () => ({
-  dispatchRuntimeCommand: vi.fn(),
+  dispatchRuntimeCommand: (...args: unknown[]) => dispatchRuntimeCommand(...args),
 }));
 
-const { executeTool } = await import("@/lib/agent/executeTool");
+const { executeTool, isBuildCommand } = await import("@/lib/agent/executeTool");
 
 function toolCall(name: string, args: Record<string, unknown> = {}) {
   return {
@@ -34,6 +35,7 @@ function toolCall(name: string, args: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   viewPreview.mockReset();
+  dispatchRuntimeCommand.mockReset();
 });
 
 describe("executeTool - view_preview vision-failure signal (Phase 26 section 4)", () => {
@@ -222,5 +224,157 @@ describe("executeTool - view_preview vision-failure signal across a real call se
     viewPreview.mockResolvedValueOnce(failingViewPreview("fail-again"));
     const afterRecovery = await executeTool("s1", toolCall("view_preview"), { consecutiveVisionFailures });
     expect(afterRecovery.content).not.toContain("stop calling view_preview");
+  });
+});
+
+/**
+ * Phase 39 (Batch 1): isBuildCommand is the classifier behind
+ * AgentTurn.buildState - deliberately conservative (see its own doc
+ * comment), so these cases prove both what it correctly recognizes AND
+ * what it correctly leaves alone.
+ */
+describe("isBuildCommand", () => {
+  it("recognizes npm/yarn/pnpm run build and the bare 'npm build' form", () => {
+    expect(isBuildCommand("npm run build")).toBe(true);
+    expect(isBuildCommand("yarn run build")).toBe(true);
+    expect(isBuildCommand("pnpm run build")).toBe(true);
+    expect(isBuildCommand("npm build")).toBe(true);
+  });
+
+  it("recognizes a direct next build invocation", () => {
+    expect(isBuildCommand("next build")).toBe(true);
+    expect(isBuildCommand("npx next build")).toBe(true);
+  });
+
+  it("does not classify install, dev, or unrelated commands as a build", () => {
+    expect(isBuildCommand("npm install")).toBe(false);
+    expect(isBuildCommand("npm run dev")).toBe(false);
+    expect(isBuildCommand("curl -s http://localhost:3000")).toBe(false);
+    expect(isBuildCommand("ls -la")).toBe(false);
+  });
+
+  it("does not false-positive on a command that merely mentions the word 'build' elsewhere", () => {
+    expect(isBuildCommand("cat build-notes.txt")).toBe(false);
+  });
+});
+
+describe("executeTool - run_command buildEvidence (Phase 39 Batch 1)", () => {
+  it("attaches buildEvidence with ok:true for a passing foreground build command", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({ status: "ok", result: { exitCode: 0, output: "Compiled successfully." } });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run build" }));
+
+    expect(result.ok).toBe(true);
+    expect(result.buildEvidence).toEqual({ command: "npm run build", ok: true });
+  });
+
+  it("attaches buildEvidence with ok:false and an errorSummary for a failing build", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({ status: "ok", result: { exitCode: 1, output: "Error: something broke" } });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run build" }));
+
+    expect(result.ok).toBe(false);
+    expect(result.buildEvidence?.ok).toBe(false);
+    expect(result.buildEvidence?.command).toBe("npm run build");
+    expect(result.buildEvidence?.errorSummary).toContain("something broke");
+  });
+
+  it("does not attach buildEvidence for a non-build foreground command", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({ status: "ok", result: { exitCode: 0, output: "" } });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm install" }));
+
+    expect(result.buildEvidence).toBeUndefined();
+  });
+
+  it("does not attach buildEvidence for a background command, even if it happens to say 'build'", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({ status: "ok", result: { status: "ready", port: 3000, url: "http://localhost:3000" } });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run build", background: true }));
+
+    expect(result.buildEvidence).toBeUndefined();
+  });
+});
+
+/**
+ * Phase 40 §6D: prompt.ts documents this exact failure happening live -
+ * the model ran the dev server in the foreground to read its startup
+ * log, it never exited, hung for the full 130s foreground timeout, got
+ * force-killed, and left the runtime worse off. The prompt said "never"
+ * for a long time; these pin that it is now actually enforced.
+ */
+describe("executeTool - foreground dev-server rejection (Phase 40 §6D)", () => {
+  it("rejects a foreground dev server immediately, without ever dispatching to the runtime", async () => {
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run dev" }));
+
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("FOREGROUND_DEV_SERVER_REJECTED");
+    expect(result.content).toContain("background: true");
+    // The whole point is not waiting 130s to find out - the relay is never touched.
+    expect(dispatchRuntimeCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects varied dev-server spellings in the foreground", async () => {
+    for (const command of ["yarn dev", "next dev", "npm run dev -- -p 3001"]) {
+      dispatchRuntimeCommand.mockClear();
+      const result = await executeTool("s1", toolCall("run_command", { command }));
+      expect(result.ok).toBe(false);
+      expect(result.content).toContain("FOREGROUND_DEV_SERVER_REJECTED");
+      expect(dispatchRuntimeCommand).not.toHaveBeenCalled();
+    }
+  });
+
+  it("ALLOWS the same dev-server command with background: true - the correct path is untouched", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({
+      status: "ok",
+      result: { status: "ready", port: 3000, url: "http://localhost:3000" },
+    });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run dev", background: true }));
+
+    expect(result.ok).toBe(true);
+    expect(dispatchRuntimeCommand).toHaveBeenCalled();
+  });
+
+  it("does not interfere with a foreground BUILD, which must still run normally", async () => {
+    dispatchRuntimeCommand.mockResolvedValue({ status: "ok", result: { exitCode: 0, output: "ok" } });
+
+    const result = await executeTool("s1", toolCall("run_command", { command: "npm run build" }));
+
+    expect(result.ok).toBe(true);
+    expect(dispatchRuntimeCommand).toHaveBeenCalled();
+  });
+});
+
+describe("executeTool - view_preview previewEvidence (Phase 39 Batch 1)", () => {
+  it("reports verified:true with the real previewUrl on a successful capture, independent of vision's critique", async () => {
+    viewPreview.mockResolvedValue({
+      status: "success",
+      message: "Screenshot captured.",
+      viewport: { width: 1440, height: 900 },
+      screenshot: "data:image/jpeg;base64,x",
+      screenshotHash: "h1",
+      previewUrl: "https://example.com/preview",
+      // Vision itself failed/is unavailable - previewEvidence must stay verified:true anyway,
+      // since capture succeeding (not vision's opinion) is what PREVIEW_VERIFIED means.
+      analysis: { status: "unavailable", reason: "rate-limited", retryable: true },
+      paintReadyMs: 100,
+    });
+
+    const result = await executeTool("s1", toolCall("view_preview"));
+
+    expect(result.previewEvidence).toEqual({ verified: true, previewUrl: "https://example.com/preview" });
+  });
+
+  it("reports verified:false with a reason when the capture itself fails", async () => {
+    viewPreview.mockResolvedValue({ status: "not_ready", message: "No live preview page yet." });
+
+    const result = await executeTool("s1", toolCall("view_preview"));
+
+    expect(result.previewEvidence).toEqual({
+      verified: false,
+      previewUrl: null,
+      reason: "not_ready: No live preview page yet.",
+    });
   });
 });

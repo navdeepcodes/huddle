@@ -155,7 +155,7 @@ describe("viewPreview - server readiness (Phase 17)", () => {
       setHostQueue([{ state: "installing" }]); // never progresses
 
       const done = viewPreview("s1");
-      await vi.advanceTimersByTimeAsync(26_000); // past STATE_READY_WAIT_MS
+      await vi.advanceTimersByTimeAsync(51_000); // past STATE_READY_WAIT_MS (Phase 40: 25s -> 50s)
       const result = await done;
 
       expect(result.status).toBe("starting");

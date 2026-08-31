@@ -96,6 +96,17 @@ service cloud.firestore {
     //   allow read, write: if false;
     // }
 
+    // Phase 38: sessionFeedback (a world-access visitor's free-text
+    // suggestion) and the new worldAccess/isProposal/proposalOf fields on
+    // sessions follow the exact same precedent - owner reads feedback
+    // through an Admin-SDK GET route, never client-direct, and the new
+    // /api/public/projects/[sessionId]/* routes are unauthenticated
+    // Admin-SDK routes that check session.worldAccess themselves (rules
+    // can't help an unauthenticated caller either way, since every read
+    // rule above requires isSignedIn()). No client ever reads or writes
+    // sessionFeedback directly, so it needs no rules block of its own -
+    // the deny-by-default catch-all below already covers it correctly.
+
     // ==========================================================
     // Legacy apostle collections (copied verbatim - do not edit here)
     // ==========================================================

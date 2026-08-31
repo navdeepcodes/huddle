@@ -3,15 +3,17 @@ import "server-only";
 import { adminDb } from "@/lib/firebase/admin";
 import { resolveAgentProviders } from "@/lib/agent/providerResolution";
 import { generateStepWithRecovery } from "@/lib/agent/providerRecovery";
+import { AgentProviderError } from "@/lib/agent/provider";
+import { computeFileBudget, buildFileBudgetWarning } from "@/lib/agent/fileBudget";
 import { logProviderCall } from "@/lib/agent/providerTelemetry";
 import { buildTeammateLabels } from "@/lib/presence/attribution";
 import { AGENT_TOOLS } from "@/lib/agent/tools";
 import { SYSTEM_PROMPT } from "@/lib/agent/prompt";
-import { executeTool } from "@/lib/agent/executeTool";
+import { executeTool, refuseForBudget, isRuntimeRestartCall } from "@/lib/agent/executeTool";
 import { batchWriteSessionFiles } from "@/lib/files/fileStore";
-import { registerTurn, unregisterTurn } from "@/lib/agent/turnRegistry";
+import { registerTurn, unregisterTurn, heartbeatTurnClaim, releaseTurnClaim } from "@/lib/agent/turnRegistry";
 import { processWriteFileBatch } from "@/lib/agent/processWriteFileBatch";
-import { checkImportConventions } from "@/lib/agent/importConventionCheck";
+import { checkImportConventions, autoFixBrandIcons } from "@/lib/agent/importConventionCheck";
 import { createCheckpoint } from "@/lib/checkpoints/checkpointStore";
 import {
   parseTaskStateUpdate,
@@ -24,11 +26,17 @@ import {
   buildFinishModeNudge,
   buildBlockingPreviewNudge,
   buildBudgetExhaustedSummary,
+  buildEvidenceNudge,
+  buildWallClockExhaustedSummary,
+  buildProviderTransitionNudge,
+  buildEarlyBuildNudge,
 } from "@/lib/agent/taskProgress";
 
 import type { IterationAction } from "@/lib/agent/taskProgress";
 import type {
   AgentTurn,
+  BuildState,
+  PreviewVerificationState,
   TaskState,
   TurnMessage,
   TurnTelemetry,
@@ -90,6 +98,80 @@ const MAX_INCOMPLETE_OBJECTIVE_NUDGES = 1;
 const FINISH_MODE_REMAINING_THRESHOLD = 8;
 const MAX_FINISH_MODE_NUDGES = 1;
 const MAX_BLOCKING_PREVIEW_NUDGES = 1;
+/** Phase 39 (Batch 1): same tier as the other bounded nudges above - one chance to supply the missing build/preview/file evidence before the turn honestly reports evidence_incomplete instead of a false "done". */
+const MAX_EVIDENCE_NUDGES = 1;
+/**
+ * Phase 39C: exactly one retry after a provider-side truncation that
+ * produced no tool call - see the truncation branch in the step loop
+ * for the live failure this closes. Strictly bounded, same discipline
+ * as every nudge cap above: if the retry truncates the same way, the
+ * turn ends honestly as truncated_no_action rather than looping.
+ */
+const MAX_TRUNCATED_NO_ACTION_RETRIES = 1;
+
+/**
+ * Phase 40 §7: the hard elapsed-time ceiling for one turn. STEP_BUDGET
+ * bounds ITERATIONS but nothing bounded elapsed TIME, and the two are
+ * not equivalent: with a 180s per-request provider timeout and bounded
+ * retries, a single pathological iteration can run for many minutes, so
+ * 40 of them had no meaningful upper bound at all (measured worst case
+ * before this: ~12 hours).
+ *
+ * 20 minutes is chosen from the real observed distribution of this
+ * system's own successful builds, not invented: 10.7 min (Bloom &
+ * Stem), 17.5 min (Pathway SaaS), 23.2 min (Flour & Fig), against
+ * pathological runs measured in hours. 20 min clears the great majority
+ * of legitimate builds while cutting the tail that can only be a stuck
+ * system. It is deliberately a CEILING, not a target - a healthy build
+ * should finish far inside it.
+ */
+const TURN_WALL_CLOCK_BUDGET_MS = 20 * 60_000;
+
+/**
+ * Phase 40 §8: the claim heartbeat used to fire only at iteration
+ * boundaries, so a single long provider call could exceed
+ * TURN_CLAIM_STALE_MS (5 min) and let a genuinely-alive turn be
+ * reclaimed out from under itself. Rather than making the claim
+ * immortal (explicitly rejected) or shrinking the provider timeout
+ * (would kill legitimately slow calls - 132s and 177s both observed
+ * live), the heartbeat runs on this cadence FOR THE DURATION OF an
+ * in-flight provider call and is cleared the moment it returns. Scoped
+ * to one call's lifetime, never free-running: an abandoned process
+ * stops beating immediately and its claim still goes stale normally.
+ */
+const CLAIM_HEARTBEAT_INTERVAL_MS = 60_000;
+
+/**
+ * Phase 40 §6A: total build attempts allowed in one turn. The prompt
+ * has always said "cap yourself at 2-3 build attempts against the same
+ * underlying error", and buildState.attempt has always been INCREMENTED
+ * - but nothing ever read it, so the cap was advisory and a model could
+ * rebuild until the step budget ran out. This is that cap, enforced.
+ * 3 matches the prompt's own wording so the two can't drift.
+ */
+const MAX_BUILD_ATTEMPTS = 3;
+
+/**
+ * Phase 40 §6B: total dev-server restarts/recoveries allowed in one
+ * turn. Previously prompt-only ("restarting is expensive and should be
+ * rare"), with the sole code-level guard being an exact-string reuse
+ * memo in runtimeSession - so any varied restart command spawned
+ * freely and nothing counted them.
+ */
+const MAX_RUNTIME_RESTARTS = 2;
+
+/**
+ * Phase 42 §7: "the agent can write for 14 iterations without ever
+ * building" - Phase 41C's own real trace, 19 files, 0 build attempts.
+ * The prompt already says to build the bare scaffold and then the
+ * first implementation batch (prompt.ts §2, steps 6/8) - this is the
+ * code-enforced backstop for when that advisory sequence doesn't get
+ * followed. 4 files is deliberately close to fileBudget.ts's own
+ * DEFAULT_FILE_BUDGET (8) 's midpoint - enough that a genuinely tiny
+ * edit never trips it, small enough to catch the problem while there's
+ * still time saved by catching it.
+ */
+const EARLY_BUILD_FILE_THRESHOLD = 4;
 
 function emptyTelemetry(): TurnTelemetry {
   return {
@@ -100,6 +182,7 @@ function emptyTelemetry(): TurnTelemetry {
     iterationDurationsMs: [],
     timeToFirstRunMs: null,
     timeToFirstPreviewMs: null,
+    timeToFirstBuildMs: null,
     totalDurationMs: null,
     terminationReason: null,
     repeatedIterations: 0,
@@ -107,6 +190,11 @@ function emptyTelemetry(): TurnTelemetry {
     incompleteObjectiveNudgesSent: 0,
     finishModeNudgesSent: 0,
     blockingPreviewNudgesSent: 0,
+    evidenceNudgesSent: 0,
+    truncatedNoActionRetries: 0,
+    providerFallback: { activated: false, fromProviderId: null, toProviderId: null, reason: null },
+    fileBudgetWarningSent: false,
+    buildEarlyNudgeSent: false,
   };
 }
 
@@ -184,6 +272,24 @@ export async function runAgentTurn(
   sessionId: string,
   userMessage: string,
   uid: string,
+  /**
+   * Phase 39 (Batch 1): proof this process actually holds the
+   * authoritative claim on this turn (see turnRegistry.ts's
+   * claimTurnAuthoritative) - the caller must claim BEFORE calling
+   * this function, not the other way around, since the claim is what
+   * decides whether a turn may start at all (a rejected claim means
+   * the caller returns 409 without ever reaching runAgentTurn).
+   */
+  turnToken: string,
+  /**
+   * Phase 39 (Batch 1): whether this session already had real project
+   * files before this turn started (Session.hasRealFiles at claim
+   * time) - feeds the completion gate's FILES_WRITTEN check alongside
+   * whatever this turn itself writes, so a continuation turn on an
+   * already-real project isn't wrongly treated as having written
+   * nothing. A brand-new session (first-ever turn) passes false.
+   */
+  hasRealFilesAtTurnStart: boolean,
   memberIds: string[] = []
 ): Promise<void> {
   const controller = registerTurn(sessionId);
@@ -275,6 +381,58 @@ export async function runAgentTurn(
    */
   let previousPreviewCheck: { screenshotHash: string; critique: string; provider: string } | undefined;
   let consecutiveVisionFailures = 0;
+  /**
+   * Phase 39 (Batch 1): real, orchestrator-checked facts for THIS turn
+   * only (never carried across a continuation, unlike taskState) - see
+   * BuildState/PreviewVerificationState's own doc comments. Populated
+   * from executeTool's buildEvidence/previewEvidence, persisted on
+   * AgentTurn, and read by the completion gate below.
+   */
+  let buildState: BuildState | undefined;
+  let previewState: PreviewVerificationState | undefined;
+  /**
+   * Phase 39 (Batch 1): the intent-aware signal for the completion
+   * gate - is this turn's actual work a web project? scaffoldCalledThisTurn
+   * alone is unambiguous evidence; wroteFileThisTurn is required
+   * alongside an INHERITED projectContract (see the gate itself) so a
+   * continuation turn that only does something unrelated (e.g.
+   * create_presentation) on an existing web-project session is never
+   * wrongly gated on build/preview evidence it never needed.
+   */
+  let scaffoldCalledThisTurn = false;
+  let wroteFileThisTurn = false;
+  /**
+   * Phase 40 §7: one absolute timestamp, computed once, threaded to
+   * every place that can start expensive work (the iteration gate
+   * below, generateStepWithRecovery's retry loop, and executeTool's
+   * expensive-tool gate). Deliberately an absolute deadline rather than
+   * a duration each layer re-derives - there is exactly one definition
+   * of "this turn is out of time."
+   */
+  const turnDeadline = startedAt + TURN_WALL_CLOCK_BUDGET_MS;
+  /** Phase 40 §6B: per-turn cap on runtime restarts/recoveries (see MAX_RUNTIME_RESTARTS). */
+  let runtimeRestartsThisTurn = 0;
+  /**
+   * Phase 41C §3: which provider in `agentProviders` owns the REST of
+   * this turn. Starts at the primary (0). generateStepWithRecovery is
+   * only ever given `agentProviders.slice(committedProviderIndex)` -
+   * once a later provider succeeds, this advances and the primary is
+   * never retried again this turn. Without this, every iteration would
+   * independently start back at the primary, re-paying its full attempt
+   * budget on every single step even after it's already shown itself to
+   * be failing - "primary -> fallback -> primary -> fallback" oscillation,
+   * exactly what Phase 41 explicitly ruled out. This is the ONE place
+   * that decides provider ownership; generateStepWithRecovery itself is
+   * unchanged and still just tries whatever list it's handed, in order.
+   */
+  let committedProviderIndex = 0;
+  /**
+   * Phase 42 §2/§7: distinct NEW file paths written THIS turn - not
+   * pre-existing files from a continuation, since the budget is about
+   * this turn's own generation effort. Backs both the file-budget
+   * warning and the early-build nudge below.
+   */
+  const wroteFilePaths = new Set<string>();
 
   try {
     for (let i = 0; i < STEP_BUDGET; i++) {
@@ -283,13 +441,43 @@ export async function runAgentTurn(
         break;
       }
 
+      // Phase 40 §7: the wall-clock ceiling, checked BEFORE any new
+      // expensive work is started. An already-in-flight request is
+      // allowed to finish (interrupting it would waste what it already
+      // spent); this only guarantees nothing NEW begins past the
+      // deadline. Expensive per-tool operations enforce the same
+      // deadline themselves - see executeTool's ExecuteToolContext.
+      if (Date.now() >= turnDeadline) {
+        terminationReason = "wall_clock_exhausted";
+        log.push({
+          role: "assistant",
+          content: buildWallClockExhaustedSummary(taskState, TURN_WALL_CLOCK_BUDGET_MS),
+          createdAt: Date.now(),
+        });
+        break;
+      }
+
       telemetry.iterations++;
       const iterationStartedAt = Date.now();
 
       let step;
       const callStartedAt = Date.now();
+      // Phase 41C §3: only the providers from the current commit point
+      // onward are ever offered - see committedProviderIndex's own doc
+      // comment for why (no primary/fallback oscillation across
+      // iterations).
+      const candidateProviders = agentProviders.slice(committedProviderIndex);
+      // Phase 40 §8: keep the turn claim alive across a long provider
+      // call. Cleared unconditionally in the finally below, so this can
+      // never outlive the call it belongs to.
+      const claimHeartbeat = setInterval(() => {
+        void heartbeatTurnClaim(sessionId, turnToken).catch(() => {
+          // A failed beat is not itself fatal - the split-brain guard
+          // after the iteration is what actually acts on lost ownership.
+        });
+      }, CLAIM_HEARTBEAT_INTERVAL_MS);
       try {
-        const result = await generateStepWithRecovery(agentProviders, messages, AGENT_TOOLS, signal);
+        const result = await generateStepWithRecovery(candidateProviders, messages, AGENT_TOOLS, signal, undefined, turnDeadline);
         step = result.step;
         logProviderCall({
           uid,
@@ -302,24 +490,64 @@ export async function runAgentTurn(
           attempts: result.attempts,
           usage: step.usage,
         });
+
+        // Phase 41C §3/§12: the primary in THIS call's candidate list
+        // failed and a later provider served the step - commit to it for
+        // the rest of the turn and record the one transition fact.
+        if (result.providerId !== candidateProviders[0]?.id) {
+          const newIndex = agentProviders.findIndex((p) => p.id === result.providerId);
+          telemetry.providerFallback = {
+            activated: true,
+            fromProviderId: candidateProviders[0]?.id ?? null,
+            toProviderId: result.providerId,
+            reason: "provider_exhausted",
+          };
+          if (newIndex >= 0) committedProviderIndex = newIndex;
+          // Phase 41C §"USER-FACING ACTIVITY": honest but simple, never
+          // the raw provider error text.
+          log.push({
+            role: "assistant",
+            content: "Huddle switched to a backup model and continued.",
+            createdAt: Date.now(),
+          });
+          const transitionNudge = buildProviderTransitionNudge(taskState, {
+            buildPassed: buildState?.status === "passed",
+            previewVerified: previewState?.verified === true,
+          });
+          messages.push({ role: "user", content: transitionNudge });
+          log.push({ role: "user", content: transitionNudge, isNudge: true, createdAt: Date.now() });
+        }
       } catch (error) {
         logProviderCall({
           uid,
           sessionId,
-          provider: agentProviders[0]?.id ?? "unknown",
-          model: agentProviders[0]?.model ?? "unknown",
+          provider: candidateProviders[0]?.id ?? "unknown",
+          model: candidateProviders[0]?.model ?? "unknown",
           turnId: `${sessionId}_${startedAt}`,
           success: false,
           latencyMs: Date.now() - callStartedAt,
-          attempts: agentProviders.length * 3,
+          // Phase 41C: worst-case attempt count for telemetry only (the
+          // real count is unknowable here - the error already discarded
+          // it) - summed per-provider budgets, since a fallback provider
+          // can now have a smaller one than the default.
+          attempts: candidateProviders.reduce((sum, p) => sum + (p.maxAttempts ?? 4), 0),
         });
         terminationReason = signal.aborted ? "cancelled" : "provider_error";
+        // Phase 41C §"USER-FACING ACTIVITY": never expose raw provider
+        // internals (HTTP status, "NVIDIA", model names) in the normal
+        // log - the technical detail still lives in providerTelemetry's
+        // own logs for debugging.
         log.push({
           role: "assistant",
-          content: `(step failed: ${error instanceof Error ? error.message : String(error)})`,
+          content:
+            error instanceof AgentProviderError && error.kind === "cancelled"
+              ? "(cancelled)"
+              : "Huddle couldn't finish this build right now. Your project is saved and can be continued.",
           createdAt: Date.now(),
         });
         break;
+      } finally {
+        clearInterval(claimHeartbeat);
       }
 
       messages.push(step.message);
@@ -343,6 +571,96 @@ export async function runAgentTurn(
         // SOME visible text doesn't mean the model chose to stop - only
         // an untruncated response with no tool call does.
         if (step.truncated) {
+          // Phase 39C: this used to terminate the whole turn on the
+          // FIRST provider-side truncation, which threw away every
+          // tool result the turn had already earned. Live-reproduced
+          // (2026-08-28, session VZ54JRXfEATLzAtji1hi): iteration 1
+          // reasoned briefly and successfully called
+          // scaffold_nextjs_project (7 real files written); iteration 2
+          // then spent essentially its whole 8000-token output budget
+          // on hidden reasoning tokens (enable_thinking is on for this
+          // provider - reasoning and tool-call emission compete for ONE
+          // budget), emitted ~175 visible chars, and returned
+          // finish_reason "length" with zero tool calls. The turn died
+          // with a perfectly good scaffold on disk and nothing wrong
+          // with the project at all.
+          //
+          // This is a transient provider-side outcome, not a decision
+          // by the model to stop - so it now gets the same bounded
+          // second chance every other transient failure in this system
+          // already gets. Retrying is safe by construction: tool calls
+          // only ever execute AFTER a step returns (see
+          // providerRecovery.ts's own doc comment on the same
+          // property), so a retry can never re-run an earlier tool
+          // call, and `messages`/`taskState` are only appended to -
+          // the retry genuinely continues from the current state
+          // rather than restarting anything.
+          if (telemetry.truncatedNoActionRetries < MAX_TRUNCATED_NO_ACTION_RETRIES) {
+            telemetry.truncatedNoActionRetries++;
+            // Deliberately terse, and only ever injected on this exact
+            // path - the normal reasoning behavior the system prompt
+            // asks for is unchanged for every other step.
+            const recovery =
+              "The previous response used its output budget before producing the next tool call. Continue immediately from the current project state. Do not provide extended planning or explanation. Take the next required tool action now.";
+            messages.push({ role: "user", content: recovery });
+            log.push({ role: "user", content: recovery, isNudge: true, createdAt: Date.now() });
+            telemetry.iterationDurationsMs.push(Date.now() - iterationStartedAt);
+            await turnRef.update({
+              log,
+              telemetry,
+              providerMessages: messages,
+              ...(taskState ? { taskState } : {}),
+              ...(buildState ? { buildState } : {}),
+              ...(previewState ? { previewState } : {}),
+            });
+            continue;
+          }
+
+          /**
+           * Phase 41C §5: truncation exhausted its own bounded retry -
+           * before giving up on the whole turn, try the next provider
+           * (if one hasn't been tried yet this turn). Genuinely
+           * provider-side and transient (see the comment above), so it's
+           * treated exactly like an AgentProviderError exhaustion for
+           * fallback purposes - the same committedProviderIndex
+           * mechanism, the same one-time transition nudge. The new
+           * provider gets its OWN fresh truncatedNoActionRetries budget
+           * (reset here) rather than inheriting an already-spent one -
+           * this specific failure mode hasn't happened to it yet.
+           */
+          if (committedProviderIndex + 1 < agentProviders.length) {
+            const fromProvider = agentProviders[committedProviderIndex];
+            committedProviderIndex++;
+            telemetry.truncatedNoActionRetries = 0;
+            telemetry.providerFallback = {
+              activated: true,
+              fromProviderId: fromProvider?.id ?? null,
+              toProviderId: agentProviders[committedProviderIndex]?.id ?? null,
+              reason: "truncated_no_action_exhausted",
+            };
+            log.push({
+              role: "assistant",
+              content: "Huddle switched to a backup model and continued.",
+              createdAt: Date.now(),
+            });
+            const transitionNudge = buildProviderTransitionNudge(taskState, {
+              buildPassed: buildState?.status === "passed",
+              previewVerified: previewState?.verified === true,
+            });
+            messages.push({ role: "user", content: transitionNudge });
+            log.push({ role: "user", content: transitionNudge, isNudge: true, createdAt: Date.now() });
+            telemetry.iterationDurationsMs.push(Date.now() - iterationStartedAt);
+            await turnRef.update({
+              log,
+              telemetry,
+              providerMessages: messages,
+              ...(taskState ? { taskState } : {}),
+              ...(buildState ? { buildState } : {}),
+              ...(previewState ? { previewState } : {}),
+            });
+            continue;
+          }
+
           terminationReason = "truncated_no_action";
           log.push({
             role: "assistant",
@@ -390,7 +708,91 @@ export async function runAgentTurn(
           continue;
         }
 
-        terminationReason = hasOnlyBlockedRemaining(taskState) ? "blocked" : "done";
+        // Phase 39 (Batch 1) hard termination contract: for a turn
+        // whose actual work is a web project, "done" requires real,
+        // orchestrator-checked evidence - not just an absence of
+        // tracked/blocked subgoals and not just "view_preview didn't
+        // explicitly fail" (the two gates above). isWebProjectTurn is
+        // deliberately code-derived, not model-declared: a scaffold
+        // call this turn is unambiguous; an INHERITED projectContract
+        // (continuation turns keep it across turns by design) only
+        // counts alongside wroteFileThisTurn, so a follow-up turn that
+        // does something unrelated on an existing web-project session
+        // (e.g. create_presentation, no file writes) is never wrongly
+        // gated on evidence it never needed to produce.
+        const isWebProjectTurn = scaffoldCalledThisTurn || (Boolean(taskState?.projectContract) && wroteFileThisTurn);
+        const filesWritten = hasRealFilesAtTurnStart || wroteFileThisTurn;
+        const evidenceMissing =
+          isWebProjectTurn && (!filesWritten || buildState?.status !== "passed" || previewState?.verified !== true);
+
+        // Phase 40 §6A: if the build budget is spent and the build
+        // still never passed, nudging again is pointless - the model
+        // has no way to produce the missing evidence, because the one
+        // tool that could is now refused. Terminate honestly with the
+        // specific reason instead of spending the evidence nudge on an
+        // impossible request.
+        if (
+          evidenceMissing &&
+          buildState?.status !== "passed" &&
+          (buildState?.attempt ?? 0) >= MAX_BUILD_ATTEMPTS
+        ) {
+          terminationReason = "build_repair_budget_exhausted";
+          break;
+        }
+
+        if (evidenceMissing && telemetry.evidenceNudgesSent < MAX_EVIDENCE_NUDGES) {
+          telemetry.evidenceNudgesSent++;
+          const nudge = buildEvidenceNudge(taskState, {
+            filesWritten,
+            buildPassed: buildState?.status === "passed",
+            previewVerified: previewState?.verified === true,
+          });
+          messages.push({ role: "user", content: nudge });
+          log.push({ role: "user", content: nudge, isNudge: true, createdAt: Date.now() });
+          telemetry.iterationDurationsMs.push(Date.now() - iterationStartedAt);
+          await turnRef.update({
+            log,
+            telemetry,
+            providerMessages: messages,
+            ...(buildState ? { buildState } : {}),
+            ...(previewState ? { previewState } : {}),
+          });
+          continue;
+        }
+
+        // Phase 41: the nudge above is bounded to MAX_INCOMPLETE_OBJECTIVE_NUDGES
+        // (1) so a model that insists it's done isn't bounced forever - but that
+        // left a real gap. When the nudge budget is spent and the model still has
+        // genuinely unresolved (pending/in_progress, never explicitly marked
+        // "blocked") subgoals, hasOnlyBlockedRemaining is false, and this used to
+        // fall through to "done" by default - silently reporting an unbuilt,
+        // unverified, never-previewed project as a full success. Live-reproduced:
+        // a restaurant build stopped after one nudge with "Build Contact page" and
+        // "Verify build passes" both still pending, npm run build/view_preview
+        // never called even once, and still landed as terminationReason "done".
+        // hasOnlyBlockedRemaining already correctly distinguishes "the model
+        // explicitly gave up on specific items" ("blocked") from "everything
+        // finished" ("done") - the missing case is "neither": still unresolved,
+        // not explicitly blocked, just stopped. That's the same "ran out of
+        // runway before finishing" situation step_budget_exhausted already means,
+        // and reusing it also gets the existing budget-exhausted summary (below)
+        // for free instead of silently reporting nothing.
+        //
+        // Phase 39 (Batch 1) adds one more branch: even with no
+        // unresolved/blocked subgoals, a web-project turn missing real
+        // build/preview/file evidence (evidenceMissing, computed above,
+        // still true after the nudge budget was already spent) lands on
+        // "evidence_incomplete" rather than a false "done" - the same
+        // "self-reported completion isn't backed by real facts" gap
+        // "blocked" was originally added to close, extended to evidence
+        // the model can't just self-attest.
+        terminationReason = hasOnlyBlockedRemaining(taskState)
+          ? "blocked"
+          : hasUnresolvedSubgoals(taskState)
+            ? "step_budget_exhausted"
+            : evidenceMissing
+              ? "evidence_incomplete"
+              : "done";
         break;
       }
 
@@ -413,7 +815,7 @@ export async function runAgentTurn(
           const resultContent = parsed.ok
             ? `Tracked. ${parsed.taskState.subgoals.length} subgoal(s): ${parsed.taskState.subgoals
                 .map((s) => `${s.description} [${s.status}]`)
-                .join("; ")}${parsed.taskState.projectContract ? " | project contract recorded." : ""}`
+                .join("; ")}${parsed.taskState.projectContract ? " | project contract recorded." : ""}${parsed.taskState.manifest ? " | project manifest recorded." : ""}`
             : `INVALID_TOOL_ARGUMENTS: ${parsed.error}`;
 
           if (parsed.ok) {
@@ -429,9 +831,14 @@ export async function runAgentTurn(
             // 16) - the merged contract must be OMITTED, not present as
             // undefined, when neither this call nor any prior one set one.
             const mergedContract = parsed.taskState.projectContract ?? taskState?.projectContract;
+            // Phase 42 §3: manifest gets the exact same merge-persist
+            // treatment - a later call that only updates subgoal status
+            // must not silently erase an already-stated fileBudget/plan.
+            const mergedManifest = parsed.taskState.manifest ?? taskState?.manifest;
             taskState = {
               ...parsed.taskState,
               ...(mergedContract ? { projectContract: mergedContract } : {}),
+              ...(mergedManifest ? { manifest: mergedManifest } : {}),
             };
             telemetry.successfulActions++;
           } else {
@@ -461,6 +868,25 @@ export async function runAgentTurn(
           }))
         );
 
+        // Phase 39: silently substitute an unavailable brand/logo icon
+        // (Github, Linkedin, ...) BEFORE the reject check even runs -
+        // see autoFixBrandIcons' own doc comment for why this replaced
+        // a reject-and-retry cycle that kept recurring live even with
+        // strong prompt guidance in place. Applied to batch.toWrite's
+        // own content in place, so both persistence and the contract
+        // check below see the corrected file, never the original.
+        const iconFixNotes = new Map<string, string>();
+        for (const file of batch.toWrite) {
+          const fix = autoFixBrandIcons(file.content);
+          if (fix) {
+            file.content = fix.content;
+            iconFixNotes.set(
+              file.path,
+              ` (auto-corrected: ${fix.fixed.map((f) => `${f.from}→${f.to}`).join(", ")} - brand/logo icons aren't available in lucide-react, substituted automatically, no action needed. For the real icon next time, import from react-icons/fa or react-icons/si instead.)`
+            );
+          }
+        }
+
         // Phase 18: reject a write that violates the project's own
         // declared conventions (e.g. an "@/" import when no alias is
         // configured) BEFORE it's persisted - catches the mistake at
@@ -486,44 +912,141 @@ export async function runAgentTurn(
           telemetry.toolCalls++;
           const structural = batch.results[i];
 
-          // Signature uses the file's own content, not the "Wrote X."
-          // acknowledgment - two writes to the same path with genuinely
-          // different (fixed) content must NOT read as a repeat, or
-          // real iterative editing would falsely trigger stagnation.
-          let path = "unknown";
-          let content = "";
+          // Phase 39 (Batch 1 follow-up): a call may now describe
+          // several files at once (see validateWriteFileCallArgs) - the
+          // structural result already carries one outcome per file
+          // (dedup/malformed-json only). Contract violations and icon
+          // auto-fixes are checked here, per file, since they depend on
+          // taskState.projectContract, which processWriteFileBatch
+          // deliberately doesn't know about (kept pure/Firestore-free).
+          let filePaths: Array<{ path: string; content: string }> = [];
           try {
             const args = JSON.parse(tc.type === "function" ? tc.function.arguments : "{}");
-            if (typeof args.path === "string") path = args.path;
-            if (typeof args.content === "string") content = args.content;
+            if (Array.isArray(args.files)) {
+              filePaths = args.files
+                .filter((f: unknown): f is { path: string; content: string } => {
+                  const rec = f as Record<string, unknown> | null;
+                  return typeof rec?.path === "string" && typeof rec?.content === "string";
+                })
+                .map((f: { path: string; content: string }) => ({ path: f.path, content: f.content }));
+            } else if (typeof args.path === "string" && typeof args.content === "string") {
+              filePaths = [{ path: args.path, content: args.content }];
+            }
           } catch {
             // Malformed args already reported via structural.ok below - the signature just won't be meaningful for this call.
           }
 
-          const violation = structural.ok ? contractViolations.get(path) : undefined;
-          const result = violation
-            ? { ok: false, message: `INVALID_TOOL_ARGUMENTS (content): ${violation}` }
-            : structural;
-
-          if (result.ok) telemetry.successfulActions++;
-          else telemetry.failedActions++;
-
-          messages.push({ role: "tool", tool_call_id: tc.id, content: result.message });
-          log.push({
-            role: "tool",
-            toolName: "write_file",
-            toolCallId: tc.id,
-            content: result.message,
-            ok: result.ok,
-            createdAt: Date.now(),
-            // Phase 24: structured path for change-visibility UI - see
-            // TurnMessage.path's own doc comment. Only set when the
-            // write actually succeeded; a rejected/superseded call has
-            // no real change to attribute a path to.
-            ...(result.ok ? { path } : {}),
+          // Three real outcomes per file, not a boolean: "written" (persisted),
+          // "superseded" (a later call in this same step won the same path -
+          // expected, not an error), "violation" (rejected for a project-
+          // convention violation - a real error). Only "violation" should
+          // ever count as a failure; "superseded" is the model's intent
+          // still being honored, just by a different call.
+          type EffectiveFile = { path: string; status: "written" | "superseded" | "violation"; note?: string; violationMessage?: string };
+          const effectiveFiles: EffectiveFile[] = structural.files.map((f) => {
+            if (!f.written) return { path: f.path, status: "superseded" };
+            const violation = contractViolations.get(f.path);
+            if (violation) return { path: f.path, status: "violation", violationMessage: `INVALID_TOOL_ARGUMENTS (content): ${violation}` };
+            const iconFixNote = iconFixNotes.get(f.path);
+            return { path: f.path, status: "written", ...(iconFixNote ? { note: iconFixNote } : {}) };
           });
 
-          iterationActions.push({ toolName: "write_file", argsKey: path, ok: result.ok, resultContent: content });
+          const hasViolation = effectiveFiles.some((f) => f.status === "violation");
+          const anyWritten = effectiveFiles.some((f) => f.status === "written");
+          // Structural failure (malformed/invalid, zero files identified) or
+          // a real convention violation are the only failure cases -
+          // superseded-only is still a successful, well-formed call.
+          const allOk = structural.ok && !hasViolation;
+
+          let combinedMessage: string;
+          if (effectiveFiles.length === 0) {
+            // Malformed/structurally invalid call - original message stands as-is.
+            combinedMessage = structural.message;
+          } else if (effectiveFiles.length === 1) {
+            const f = effectiveFiles[0];
+            combinedMessage = f.violationMessage ?? `${structural.message}${f.note ?? ""}`;
+          } else {
+            const written = effectiveFiles.filter((f) => f.status === "written");
+            const violated = effectiveFiles.filter((f) => f.status === "violation");
+            const superseded = effectiveFiles.filter((f) => f.status === "superseded");
+            const parts: string[] = [];
+            if (written.length > 0) {
+              parts.push(
+                `Wrote ${written.length} file(s): ${written.map((f) => `${f.path}${f.note ?? ""}`).join(", ")}.`
+              );
+            }
+            if (violated.length > 0) {
+              parts.push(`Rejected ${violated.length} file(s) for a project-convention violation: ${violated.map((f) => `${f.path} (${f.violationMessage})`).join("; ")}`);
+            }
+            if (superseded.length > 0) {
+              parts.push(
+                `${superseded.length} file(s) in this same call were superseded by a later write_file call to the same path in this same step: ${superseded.map((f) => f.path).join(", ")} - that later call's content is what was actually persisted.`
+              );
+            }
+            combinedMessage = parts.join(" ");
+          }
+
+          if (allOk) telemetry.successfulActions++;
+          else telemetry.failedActions++;
+          if (anyWritten) wroteFileThisTurn = true;
+
+          // Phase 42 §2/§13: track distinct NEW files against the
+          // budget and append the warning to THIS call's own result
+          // text (not a separate message) - the model sees it in the
+          // same round trip as the write that crossed the line. Never
+          // blocks the write itself (fileBudget.ts's own doc comment).
+          // Recomputed from taskState.manifest each time (not cached
+          // once) since the manifest can arrive on the first
+          // update_progress call, which may land before or after the
+          // first write_file in the same iteration's tool_calls.
+          const newlyWrittenPaths = effectiveFiles.filter((f) => f.status === "written").map((f) => f.path);
+          for (const p of newlyWrittenPaths) wroteFilePaths.add(p);
+          if (!telemetry.fileBudgetWarningSent && newlyWrittenPaths.length > 0) {
+            const budget = computeFileBudget(taskState?.manifest);
+            if (wroteFilePaths.size > budget) {
+              telemetry.fileBudgetWarningSent = true;
+              combinedMessage += buildFileBudgetWarning(wroteFilePaths.size, budget, newlyWrittenPaths);
+            }
+          }
+
+          messages.push({ role: "tool", tool_call_id: tc.id, content: combinedMessage });
+
+          if (effectiveFiles.length === 0) {
+            log.push({
+              role: "tool",
+              toolName: "write_file",
+              toolCallId: tc.id,
+              content: combinedMessage,
+              ok: false,
+              createdAt: Date.now(),
+            });
+          } else {
+            // Phase 24: structured path for change-visibility UI - see
+            // TurnMessage.path's own doc comment. One log ROW per file
+            // (even though this was one tool_call/one provider message),
+            // so a batched call still shows each real file change
+            // individually - only set (with a real path) when that
+            // specific file was actually persisted.
+            for (const f of effectiveFiles) {
+              log.push({
+                role: "tool",
+                toolName: "write_file",
+                toolCallId: tc.id,
+                content: f.violationMessage ?? combinedMessage,
+                ok: f.status !== "violation",
+                createdAt: Date.now(),
+                ...(f.status === "written" ? { path: f.path } : {}),
+              });
+            }
+          }
+
+          // Stagnation signature: joins every file this call touched, by
+          // path and content - two calls writing the SAME set of files
+          // with the SAME content read as a genuine repeat; any real
+          // difference (even to one file among several) does not.
+          const argsKey = filePaths.length > 0 ? filePaths.map((f) => f.path).join(",") : "unknown";
+          const combinedContent = filePaths.map((f) => f.content).join(" ");
+          iterationActions.push({ toolName: "write_file", argsKey, ok: allOk, resultContent: combinedContent });
         });
       }
 
@@ -531,16 +1054,38 @@ export async function runAgentTurn(
         if (tc.type !== "function") continue;
         telemetry.toolCalls++;
 
-        const result = await executeTool(
-          sessionId,
-          tc,
-          tc.function.name === "view_preview"
-            ? { previousPreview: previousPreviewCheck, consecutiveVisionFailures }
-            : {}
-        );
+        /**
+         * Phase 40 §6A/§6B/§7: budgets enforced HERE, at the one
+         * boundary every expensive tool call passes through, rather
+         * than as prompt text the model may ignore. A refusal is
+         * returned as an ordinary failed tool result so the model sees
+         * a clear, machine-readable reason and can react - it is never
+         * a silent no-op, and never a new retry loop.
+         */
+        const budgetRefusal = refuseForBudget(tc, {
+          buildAttempts: buildState?.attempt ?? 0,
+          maxBuildAttempts: MAX_BUILD_ATTEMPTS,
+          runtimeRestarts: runtimeRestartsThisTurn,
+          maxRuntimeRestarts: MAX_RUNTIME_RESTARTS,
+          deadlinePassed: Date.now() >= turnDeadline,
+        });
 
-        if (result.ok) telemetry.successfulActions++;
-        else telemetry.failedActions++;
+        const result = budgetRefusal
+          ? { ok: false, content: budgetRefusal }
+          : await executeTool(
+              sessionId,
+              tc,
+              tc.function.name === "view_preview"
+                ? { previousPreview: previousPreviewCheck, consecutiveVisionFailures }
+                : {}
+            );
+
+        if (!budgetRefusal && isRuntimeRestartCall(tc)) runtimeRestartsThisTurn++;
+
+        if (result.ok) {
+          telemetry.successfulActions++;
+          if (tc.function.name === "scaffold_nextjs_project") scaffoldCalledThisTurn = true;
+        } else telemetry.failedActions++;
 
         if (result.isFirstSuccessfulRun && telemetry.timeToFirstRunMs === null) {
           telemetry.timeToFirstRunMs = Date.now() - startedAt;
@@ -548,8 +1093,37 @@ export async function runAgentTurn(
         if (result.isFirstSuccessfulPreview && telemetry.timeToFirstPreviewMs === null) {
           telemetry.timeToFirstPreviewMs = Date.now() - startedAt;
         }
+        if (result.buildEvidence) {
+          // Phase 42 §6: the first build ATTEMPT, pass or fail - "is
+          // the agent building early," not "did it eventually pass."
+          if (telemetry.timeToFirstBuildMs === null) {
+            telemetry.timeToFirstBuildMs = Date.now() - startedAt;
+          }
+          // Phase 39 (Batch 1): attempt increments across repeated
+          // build commands this turn - a real, orchestrator-tracked
+          // fact, not text the model has to remember. Always reflects
+          // the MOST RECENT build's outcome (a later passing build
+          // supersedes an earlier failure, and vice versa).
+          const now = Date.now();
+          buildState = {
+            status: result.buildEvidence.ok ? "passed" : "failed",
+            attempt: (buildState?.attempt ?? 0) + 1,
+            startedAt: now,
+            completedAt: now,
+            command: result.buildEvidence.command,
+            ...(result.buildEvidence.ok ? {} : { errorSummary: result.buildEvidence.errorSummary }),
+          };
+        }
         if (tc.function.name === "view_preview") {
           lastViewPreviewOk = result.ok;
+          if (result.previewEvidence) {
+            previewState = {
+              verified: result.previewEvidence.verified,
+              checkedAt: Date.now(),
+              previewUrl: result.previewEvidence.previewUrl,
+              ...(result.previewEvidence.reason ? { reason: result.previewEvidence.reason } : {}),
+            };
+          }
           if (result.previewCheck) {
             consecutiveVisionFailures = result.previewCheck.visionOk ? 0 : consecutiveVisionFailures + 1;
             previousPreviewCheck =
@@ -591,29 +1165,53 @@ export async function runAgentTurn(
       // (e.g. polling a dev server that's still starting) never trip it.
       const signature = buildIterationSignature(iterationActions);
       recentSignatures.push(signature);
-      if (detectStagnation(recentSignatures, STAGNATION_THRESHOLD)) {
-        telemetry.repeatedIterations++;
-        if (telemetry.stagnationNudgesSent < MAX_STAGNATION_NUDGES) {
-          telemetry.stagnationNudgesSent++;
-          const nudge = buildStagnationNudge(taskState);
-          messages.push({ role: "user", content: nudge });
-          log.push({ role: "user", content: nudge, isNudge: true, createdAt: Date.now() });
-          recentSignatures.length = 0; // give the model a genuinely fresh window after the nudge
-        }
-      }
+      const isStagnating = detectStagnation(recentSignatures, STAGNATION_THRESHOLD);
+      if (isStagnating) telemetry.repeatedIterations++;
 
-      // Phase 21 finish mode: bounded, evidence-based (iterations
-      // remaining), fires only while real work is still tracked as
-      // unresolved - a turn that's already done has nothing to nudge
-      // toward finishing. A prioritization nudge, not a coding
-      // sequence - see buildFinishModeNudge's own doc comment.
       const remainingIterations = STEP_BUDGET - i - 1;
-      if (
+
+      /**
+       * Phase 40 §10: EXACTLY ONE recovery nudge per iteration, chosen
+       * by explicit priority. These were two independent `if` blocks
+       * with no `else` between them, and their trigger conditions
+       * describe the same situation - a stuck late-stage build - so
+       * both fired together and handed the model two contradictory
+       * instructions in one turn ("change your approach" alongside
+       * "stop changing things and finish"). Stagnation wins: being
+       * stuck is a harder, more specific signal than merely being near
+       * the end of the budget, and finish-mode advice is actively
+       * counterproductive while the current approach isn't working.
+       * (The three completion gates above each end in `continue`, so
+       * they are already mutually exclusive with this block and with
+       * each other - this closes the one remaining overlap.)
+       *
+       * Phase 42 §7: buildEarly slots between the two - not as urgent
+       * as an actively stuck loop, but more actionable than "consider
+       * wrapping up" (which only fires late anyway): if several files
+       * exist and nothing has been built yet, proving that now is
+       * useful at ANY point in the turn, not just near the end.
+       */
+      const stagnationNudgeDue = isStagnating && telemetry.stagnationNudgesSent < MAX_STAGNATION_NUDGES;
+      const buildEarlyNudgeDue =
+        !telemetry.buildEarlyNudgeSent && buildState === undefined && wroteFilePaths.size >= EARLY_BUILD_FILE_THRESHOLD;
+      const finishModeNudgeDue =
         remainingIterations > 0 &&
         remainingIterations <= FINISH_MODE_REMAINING_THRESHOLD &&
         hasUnresolvedSubgoals(taskState) &&
-        telemetry.finishModeNudgesSent < MAX_FINISH_MODE_NUDGES
-      ) {
+        telemetry.finishModeNudgesSent < MAX_FINISH_MODE_NUDGES;
+
+      if (stagnationNudgeDue) {
+        telemetry.stagnationNudgesSent++;
+        const nudge = buildStagnationNudge(taskState);
+        messages.push({ role: "user", content: nudge });
+        log.push({ role: "user", content: nudge, isNudge: true, createdAt: Date.now() });
+        recentSignatures.length = 0; // give the model a genuinely fresh window after the nudge
+      } else if (buildEarlyNudgeDue) {
+        telemetry.buildEarlyNudgeSent = true;
+        const nudge = buildEarlyBuildNudge(wroteFilePaths.size);
+        messages.push({ role: "user", content: nudge });
+        log.push({ role: "user", content: nudge, isNudge: true, createdAt: Date.now() });
+      } else if (finishModeNudgeDue) {
         telemetry.finishModeNudgesSent++;
         const nudge = buildFinishModeNudge(taskState, remainingIterations);
         messages.push({ role: "user", content: nudge });
@@ -626,15 +1224,34 @@ export async function runAgentTurn(
         telemetry,
         providerMessages: messages,
         ...(taskState ? { taskState } : {}),
+        ...(buildState ? { buildState } : {}),
+        ...(previewState ? { previewState } : {}),
       });
+
+      // Phase 39 (Batch 1) split-brain guard: this doubles as the
+      // turn's heartbeat AND a check that this process still owns the
+      // claim. A `false` here means claimTurnAuthoritative decided
+      // this claim went stale (TURN_CLAIM_STALE_MS of silence) and was
+      // reclaimed by a newer attempt - astronomically rare given a
+      // real per-iteration write just happened above, but if it does
+      // happen, this process must stop touching Firestore immediately
+      // rather than race the new claimant for the rest of the budget.
+      if (!(await heartbeatTurnClaim(sessionId, turnToken))) {
+        terminationReason = "claim_expired";
+        break;
+      }
     }
 
-    if (terminationReason === "step_budget_exhausted") {
+    if (terminationReason === "step_budget_exhausted" || terminationReason === "evidence_incomplete") {
       // Phase 16 / Phase 8: never let the budget run out silently - the
       // final log entry states OBJECTIVE/COMPLETED/BLOCKED/LAST
       // DIAGNOSIS/NEXT RECOMMENDED ACTION from whatever the model
       // itself tracked, so hitting the budget while stuck still leaves
-      // a genuinely useful record instead of just stopping.
+      // a genuinely useful record instead of just stopping. Phase 39
+      // (Batch 1): the same applies to evidence_incomplete - a self-
+      // reported "done" that the orchestrator rejected for missing
+      // build/preview/file evidence deserves the same real record, not
+      // just the bare termination label.
       const lastAssistantEntry = [...log].reverse().find((m) => m.role === "assistant");
       log.push({
         role: "assistant",
@@ -669,8 +1286,17 @@ export async function runAgentTurn(
       telemetry,
       providerMessages: messages,
       ...(taskState ? { taskState } : {}),
+      ...(buildState ? { buildState } : {}),
+      ...(previewState ? { previewState } : {}),
       cancelledAt: terminationReason === "cancelled" ? Date.now() : null,
     });
+
+    // Phase 39 (Batch 1): release the authoritative claim - a no-op if
+    // this turn's claim was already reclaimed as stale (the split-brain
+    // guard above already broke out of the loop in that case), so a
+    // late-finishing orphaned process can never clobber a newer,
+    // legitimate claim's state.
+    await releaseTurnClaim(sessionId, turnToken, terminationReason);
 
     unregisterTurn(sessionId);
   }

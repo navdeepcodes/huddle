@@ -64,6 +64,18 @@ export interface AgentModelProvider {
   readonly id: string;
   readonly displayName: string;
   readonly model: string;
+  /**
+   * Phase 41C: total attempts (1 initial + retries) generateStepWithRecovery
+   * gives THIS provider specifically before falling through to the next
+   * one. Omitted = the function's own default (matches the primary's
+   * existing bounded policy, Phase 40B). A fallback provider can declare
+   * a smaller budget - e.g. Lightning gets 2, deliberately less than
+   * Ultra's 4, per the explicit "do not increase retry counts" /
+   * "small bounded number... appropriate to the candidate provider"
+   * requirement. This is still ONE retry owner (generateStepWithRecovery
+   * alone reads it) - not a second, provider-local retry mechanism.
+   */
+  readonly maxAttempts?: number;
 
   generateStep(
     messages: ChatCompletionMessageParam[],

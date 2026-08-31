@@ -40,10 +40,56 @@ function fakeDoc(collection: string, id: string) {
     },
   };
 }
+/**
+ * Phase 39 (Batch 1): the turn route now claims via
+ * claimTurnAuthoritative (a real Firestore transaction) instead of the
+ * old in-memory-only isTurnActive check - this test is SPECIFICALLY
+ * about genuine concurrency (two real-simultaneous POSTs via
+ * Promise.all), so the fake runTransaction must actually provide
+ * mutual exclusion, not just be callable. A naive fake that runs the
+ * callback immediately would let both concurrent calls' `tx.get`
+ * reads interleave before either `tx.set` write lands - exactly the
+ * race this test exists to prove is closed. Chaining onto a single
+ * module-level lock so only one transaction body executes at a time
+ * simulates Firestore's real per-document serialization closely enough
+ * for this single-session test (unlike runtimeHostAdmin.test.ts's fake,
+ * whose own comment says it's only sufficient for sequential calls).
+ */
+let transactionLock: Promise<void> = Promise.resolve();
+async function runTransaction<T>(
+  fn: (tx: {
+    get: (ref: ReturnType<typeof fakeDoc>) => Promise<{ exists: boolean; data: () => unknown }>;
+    set: (ref: ReturnType<typeof fakeDoc>, data: Record<string, unknown>) => void;
+    update: (ref: ReturnType<typeof fakeDoc>, data: Record<string, unknown>) => void;
+  }) => Promise<T>
+): Promise<T> {
+  const previous = transactionLock;
+  let release: () => void = () => {};
+  transactionLock = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    const tx = {
+      get: (ref: ReturnType<typeof fakeDoc>) => ref.get(),
+      set: (ref: ReturnType<typeof fakeDoc>, data: Record<string, unknown>) => {
+        void ref.set(data);
+      },
+      update: (ref: ReturnType<typeof fakeDoc>, data: Record<string, unknown>) => {
+        void ref.update(data);
+      },
+    };
+    return await fn(tx);
+  } finally {
+    release();
+  }
+}
+
 const adminDb = {
   collection: (name: string) => ({
     doc: (id: string) => fakeDoc(name, id),
   }),
+  runTransaction,
 };
 vi.mock("@/lib/firebase/admin", () => ({ adminDb }));
 

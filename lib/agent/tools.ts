@@ -8,11 +8,24 @@ import type { ChatCompletionTool } from "openai/resources/chat/completions";
  * what native tool calling exists to avoid - see apostle's
  * lib/codespace/tools.ts for the original, live-confirmed reasoning).
  *
- * Seven tools for the golden path. commit/push exist in the proven
- * legacy set but aren't registered here - nothing in "one message ->
- * working product" needs git, and adding them back later (Phase 4,
- * when GitHub integration is real) is a new file, not a rewrite of
- * this one.
+ * commit/push exist in the proven legacy set but aren't registered
+ * here - nothing in "one message -> working product" needs git, and
+ * adding them back later (Phase 4, when GitHub integration is real) is
+ * a new file, not a rewrite of this one.
+ *
+ * Phase 40: create_directory was removed entirely (2026-08-25) - live
+ * evidence (the Marginalia build) showed the model calling it twice
+ * before writing into new directories despite its own description
+ * already saying "usually unnecessary." executeTool's handler was
+ * always a pure no-op ("directories are implicit here" - see its own
+ * comment), so every call was one full model round-trip spent on
+ * literally nothing. Same lesson as the brand-icon fix: telling the
+ * model not to do something isn't reliable enough on its own when the
+ * cost of it happening anyway is a wasted turn - removing the tool
+ * means it can't be called at all. executeTool.ts's case and
+ * activityFeed.ts's display cases are left in place on purpose, to
+ * keep rendering correct for sessions that already called it before
+ * this fix.
  */
 
 const PATH_PARAM = {
@@ -33,22 +46,41 @@ export const AGENT_TOOLS: ChatCompletionTool[] = [
     function: {
       name: "write_file",
       description:
-        "Create a new file, or overwrite an existing one, with its complete new content. Not a diff/patch - always the full file text as it should be after the change. When editing a file whose content you were shown, reproduce it in full with only the necessary lines changed. Multiple write_file calls in the same step are persisted together as one batch - every single call must include its own complete path and content; a call missing either is rejected and none of the others in the batch are affected.",
+        "Create new files, or overwrite existing ones, with their complete new content. Not a diff/patch - always the full file text as it should be after the change. When editing a file whose content you were shown, reproduce it in full with only the necessary lines changed. PREFER `files` over the single `path`/`content` shortcut whenever you already know the shape of more than one file to write (e.g. a set of components, or config+data files together) - one call with several files in `files` is much faster than one call per file, and is the single biggest lever on how quickly a build finishes. Use plain `path`/`content` only for a genuinely standalone single file. Every file (whichever shortcut you use) needs its own complete path and content; one invalid file rejects the whole call so you get one clear signal to fix and retry, not a silent partial write.",
       parameters: {
         type: "object",
         properties: {
           path: {
             type: "string",
             description:
-              "Required. Session-relative path, no leading slash (e.g. \"components/Header.js\"). Every write_file call needs its own path, even when writing many files in one step.",
+              "Session-relative path for a SINGLE file (e.g. \"components/Header.js\"), no leading slash. Omit this and use `files` instead when writing more than one file in this call.",
           },
           content: {
             type: "string",
-            description: "The complete file content after this change.",
+            description: "The complete file content for the single `path` above. Omit when using `files`.",
+          },
+          files: {
+            type: "array",
+            description:
+              "Write MULTIPLE files in this one call - each with its own complete path and content. This is the preferred shape whenever you already know several files you need to write (e.g. write Header.js, Hero.js, and Footer.js together in one files array, not three separate write_file calls).",
+            items: {
+              type: "object",
+              properties: {
+                path: {
+                  type: "string",
+                  description: "Session-relative path, no leading slash (e.g. \"components/Header.js\").",
+                },
+                content: {
+                  type: "string",
+                  description: "The complete file content after this change.",
+                },
+              },
+              required: ["path", "content"],
+            },
           },
           reason: REASON_PARAM,
         },
-        required: ["path", "content", "reason"],
+        required: ["reason"],
       },
     },
   },
@@ -71,16 +103,19 @@ export const AGENT_TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "create_directory",
+      name: "scaffold_nextjs_project",
       description:
-        "Create a folder, and any missing parent folders. Usually unnecessary before write_file, which creates missing parent folders for you. Call this directly only when you want an empty folder to exist with nothing in it yet.",
+        "Deterministically writes the proven-correct Next.js Pages Router + Tailwind v4 + lucide-react boilerplate for a NEW web project in one call: package.json (correct package version ranges), next.config.mjs, postcss.config.mjs, styles/globals.css (Tailwind imported, an empty @theme block for you to fill in), and pages/_app.js. Call this ONCE, first, before writing any other file, whenever you're starting a new real web product/website from an empty project - it replaces hand-writing those five files yourself, which is exactly where version-guessing and Tailwind v4 config mistakes have come from. It does NOT write pages/index.js or any component - that's the actual product, still yours to design and write. After it returns, edit styles/globals.css to add this project's real brand colors/fonts to the @theme block (never ship it empty) - do not otherwise rewrite the five scaffolded files from scratch. Skip this tool entirely for a continuation turn on a project that already has a package.json, or for a non-Next.js/non-web request.",
       parameters: {
         type: "object",
         properties: {
-          path: PATH_PARAM,
+          projectName: {
+            type: "string",
+            description: "Optional short kebab-case name for package.json's \"name\" field (e.g. \"ember-oak-roastery\"). Defaults to a generic name if omitted - purely cosmetic, never blocks anything.",
+          },
           reason: REASON_PARAM,
         },
-        required: ["path", "reason"],
+        required: ["reason"],
       },
     },
   },
@@ -222,8 +257,104 @@ export const AGENT_TOOLS: ChatCompletionTool[] = [
             },
             required: ["framework", "router", "language", "styling", "pathAliases", "importConvention", "packageManager"],
           },
+          manifest: {
+            type: "object",
+            description:
+              "Optional, and every field within it is also optional - a compact plan for a small website, not a second required contract. State this once, briefly, on your first call, alongside projectContract: what kind of product this is, what routes it needs, and roughly which files you intend to write for the first working version. This establishes \"this is a small website\" so the file-count guideline scales to the actual project instead of a blind default - it's a few words per field, not an architectural essay.",
+            properties: {
+              projectType: { type: "string", description: "e.g. \"marketing_site\", \"portfolio\", \"saas_dashboard\"." },
+              routes: { type: "array", items: { type: "string" }, description: "Real routes/pages this product needs, e.g. [\"/\"] for a single landing page." },
+              targetFiles: { type: "array", items: { type: "string" }, description: "The files you actually intend to write for the first working version - your plan, not an exhaustive final list." },
+              fileBudget: { type: "number", description: "An explicit file-count guideline for this project, if you want to state one directly instead of implying it from targetFiles/routes." },
+            },
+          },
         },
         required: ["objective", "subgoals"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_presentation",
+      description:
+        "Generate a real, downloadable .pptx presentation as a project artifact - for a request like \"create a pitch deck\" or \"make a 7-slide presentation about X\". You provide structured slide CONTENT (headings, body text, bullets) - never binary/base64 PPTX data yourself; a deterministic engine turns your structure into the actual polished file, applying its own typography, layout, and theme. Plan a structure that fits the specific request (do not reuse a fixed template) - e.g. a pitch deck might be title, problem, solution, how it works, results, closing; a technical explainer might be title, background, architecture, implementation, results, conclusion. Choose the slide `type` that best fits each piece of content - do not force every slide into the same type. Keep each field reasonably concise (a slide is glanced at, not read like a document) - very long text is automatically fitted/truncated to stay readable, but writing tight content yourself produces a better result than relying on that. Returns the real outcome (slide count and where it was saved) on success, or a clear reason on failure - never assume it succeeded before this returns ok.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "The presentation's title (shown on the title slide)." },
+          subtitle: { type: "string", description: "Optional subtitle for the title slide." },
+          slides: {
+            type: "array",
+            description: "The full slide sequence, in order. 1-30 slides.",
+            items: {
+              type: "object",
+              properties: {
+                type: {
+                  type: "string",
+                  enum: ["title", "title_content", "two_column", "image_content", "section", "quote", "closing"],
+                  description:
+                    "title: opening slide (heading/subheading). title_content: a heading plus body text or bullets - the workhorse type. two_column: two side-by-side headed bullet lists, for a comparison or before/after. image_content: heading+body next to a labeled image placeholder (no real image is generated - this is an honest placeholder, use it only when a real image would genuinely help). section: a big, minimal divider slide between parts of the deck. quote: one large quote plus an optional attribution. closing: the final slide (e.g. \"Thank you\").",
+                },
+                heading: { type: "string" },
+                subheading: { type: "string" },
+                body: { type: "string", description: "Paragraph body text - for title_content/image_content/closing." },
+                bullets: { type: "array", items: { type: "string" }, description: "For title_content - a bulleted list instead of body text." },
+                columnLeftHeading: { type: "string" },
+                columnLeftBullets: { type: "array", items: { type: "string" } },
+                columnRightHeading: { type: "string" },
+                columnRightBullets: { type: "array", items: { type: "string" } },
+                imageCaption: { type: "string", description: "Label shown on the image placeholder, for image_content." },
+                quote: { type: "string", description: "Required for type quote." },
+                attribution: { type: "string", description: "Who said the quote, for type quote." },
+                notes: { type: "string", description: "Optional speaker notes - never shown on the slide itself." },
+              },
+              required: ["type"],
+            },
+          },
+          reason: REASON_PARAM,
+        },
+        required: ["title", "slides", "reason"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_image",
+      description:
+        "Generate a real image as a project artifact - for a request like \"create a hero image\" or \"generate an illustration of X\". A hosted image model produces real bytes; this never returns a placeholder. Write a specific, visual prompt (subject, composition, mood, style) - vague prompts produce generic results. Returns the real outcome (dimensions and where it was saved) on success, or a clear reason on failure - never assume it succeeded before this returns ok. Image generation can fail (provider unavailable, rate-limited) - if it does, say so honestly rather than claiming an image exists.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "A specific, visual description of the image to generate." },
+          aspectRatio: {
+            type: "string",
+            enum: ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"],
+            description: "Optional - defaults to the model's own default if omitted.",
+          },
+          title: { type: "string", description: "Optional short title for the artifact - defaults to a shortened version of the prompt." },
+          reason: REASON_PARAM,
+        },
+        required: ["prompt", "reason"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_image",
+      description:
+        "Edit an EXISTING image artifact already in this project (never an arbitrary URL) - for a request like \"make this warmer\" or \"increase the contrast.\" Always produces a NEW artifact; the original image is never overwritten or modified. Use list_files or the conversation's own history to find the source image's artifact id first if you don't already have it. Returns the real outcome on success, or a clear reason on failure.",
+      parameters: {
+        type: "object",
+        properties: {
+          sourceArtifactId: { type: "string", description: "The id of the existing image artifact to edit." },
+          instruction: { type: "string", description: "The specific edit to make." },
+          title: { type: "string", description: "Optional title for the new, edited artifact." },
+          reason: REASON_PARAM,
+        },
+        required: ["sourceArtifactId", "instruction", "reason"],
       },
     },
   },

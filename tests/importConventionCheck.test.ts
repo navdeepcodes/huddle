@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { checkImportConventions, checkIconImports } from "@/lib/agent/importConventionCheck";
+import { checkImportConventions, checkIconImports, autoFixBrandIcons } from "@/lib/agent/importConventionCheck";
 import type { ProjectContract } from "@/types/session";
 
 /**
@@ -143,6 +143,87 @@ describe("checkIconImports (Phase 25)", () => {
 
   it("ignores imports from other packages entirely", () => {
     expect(checkIconImports("components/Header.js", 'import { NotARealExport } from "react";')).toBeNull();
+  });
+
+  describe("brand/logo icon names - auto-fixed, not rejected (Phase 39, live-reproduced 2026-08-25 TWICE despite prompt guidance)", () => {
+    it("composed the way loop.ts actually calls them (autoFixBrandIcons first), a known brand name never reaches checkIconImports as a violation", () => {
+      const raw = 'import { Github } from "lucide-react";';
+      const fixed = autoFixBrandIcons(raw)?.content ?? raw;
+      expect(checkIconImports("components/Footer.js", fixed)).toBeNull();
+    });
+
+    it("still uses the generic 'hallucinated' message for a genuinely made-up, non-brand name", () => {
+      const result = checkIconImports("components/Header.js", 'import { ShoppingBagIconThatDoesNotExist } from "lucide-react";');
+      expect(result).toContain("hallucinated");
+    });
+  });
+
+  describe("autoFixBrandIcons (Phase 39)", () => {
+    it("returns null (nothing to fix) when there's no brand icon at all", () => {
+      expect(autoFixBrandIcons('import { Home, ShoppingCart } from "lucide-react";')).toBeNull();
+    });
+
+    it("substitutes Github, aliasing the substitute back to the original name so every JSX usage keeps working", () => {
+      const fix = autoFixBrandIcons('import { Github } from "lucide-react";\n<Github className="w-4 h-4" />');
+      expect(fix).not.toBeNull();
+      expect(fix!.content).toContain("Link as Github");
+      // The JSX usage site is untouched - Github now just resolves to Link under the hood.
+      expect(fix!.content).toContain('<Github className="w-4 h-4" />');
+      expect(fix!.fixed).toEqual([{ from: "Github", to: "Link" }]);
+    });
+
+    it("preserves an existing alias instead of the raw brand name", () => {
+      const fix = autoFixBrandIcons('import { Github as SocialIcon } from "lucide-react";');
+      expect(fix!.content).toContain("Link as SocialIcon");
+    });
+
+    it("fixes multiple brand names in one import statement, leaving real icons in the list untouched", () => {
+      const fix = autoFixBrandIcons('import { Home, Linkedin, ShoppingCart, Instagram } from "lucide-react";');
+      expect(fix!.content).toContain("Home");
+      expect(fix!.content).toContain("ShoppingCart");
+      expect(fix!.content).toContain("Link as Linkedin");
+      expect(fix!.content).toContain("Camera as Instagram");
+      expect(fix!.fixed.map((f) => f.from).sort()).toEqual(["Instagram", "Linkedin"]);
+    });
+
+    it("is case-insensitive and tolerates a trailing 'Icon' suffix", () => {
+      expect(autoFixBrandIcons('import { GITHUB } from "lucide-react";')).not.toBeNull();
+      expect(autoFixBrandIcons('import { GithubIcon } from "lucide-react";')!.content).toContain("as GithubIcon");
+    });
+
+    it("leaves a genuinely hallucinated (non-brand) name alone - not every unknown name has a safe substitute", () => {
+      expect(autoFixBrandIcons('import { ShoppingBagIconThatDoesNotExist } from "lucide-react";')).toBeNull();
+    });
+
+    it("never touches a real, already-valid icon name", () => {
+      expect(autoFixBrandIcons('import { Home, ShoppingCart, ArrowRight } from "lucide-react";')).toBeNull();
+    });
+  });
+
+  describe("react-icons/fa and react-icons/si - validated the same way (Phase 40)", () => {
+    it("allows a real react-icons/fa brand icon", () => {
+      expect(checkIconImports("components/Footer.js", 'import { FaGithub, FaLinkedin } from "react-icons/fa";')).toBeNull();
+    });
+
+    it("allows a real react-icons/si brand icon", () => {
+      expect(checkIconImports("components/Footer.js", 'import { SiTiktok } from "react-icons/si";')).toBeNull();
+    });
+
+    it("flags a hallucinated react-icons/fa name that isn't a real export", () => {
+      const result = checkIconImports("components/Footer.js", 'import { FaXTwitter } from "react-icons/fa";');
+      expect(result).not.toBeNull();
+      expect(result).toContain("FaXTwitter");
+      expect(result).toContain("react-icons/fa");
+    });
+
+    it("resolves an aliased react-icons import before checking", () => {
+      expect(checkIconImports("components/Footer.js", 'import { FaGithub as GithubIcon } from "react-icons/fa";')).toBeNull();
+      expect(checkIconImports("components/Footer.js", 'import { NotReal as GithubIcon } from "react-icons/fa";')).toContain("NotReal");
+    });
+
+    it("does not confuse react-icons/fa names with lucide-react names or vice versa", () => {
+      expect(checkIconImports("components/Footer.js", 'import { Home } from "lucide-react";\nimport { FaGithub } from "react-icons/fa";')).toBeNull();
+    });
   });
 
   it("runs independent of any projectContract - checkImportConventions flags a bad icon even with no contract set", () => {

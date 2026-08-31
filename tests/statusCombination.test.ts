@@ -26,6 +26,12 @@ function turn(log: TurnMessage[], active: boolean, terminationReason: AgentTurn[
       incompleteObjectiveNudgesSent: 0,
       finishModeNudgesSent: 0,
       blockingPreviewNudgesSent: 0,
+      evidenceNudgesSent: 0,
+      truncatedNoActionRetries: 0,
+      providerFallback: { activated: false, fromProviderId: null, toProviderId: null, reason: null },
+      timeToFirstBuildMs: null,
+      fileBudgetWarningSent: false,
+      buildEarlyNudgeSent: false,
     },
     providerMessages: [],
   };

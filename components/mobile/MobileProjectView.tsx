@@ -24,14 +24,19 @@ import { useAgentTurn } from "@/hooks/useAgentTurn";
 import { useRuntimeHost } from "@/hooks/useRuntimeHost";
 import { usePresence } from "@/hooks/usePresence";
 import { useCheckpoints } from "@/hooks/useCheckpoints";
+import { useArtifacts } from "@/hooks/useArtifacts";
 import { useHuddleComposer } from "@/hooks/useHuddleComposer";
 import { buildUnifiedFeed, type ActivityEntry, type UnifiedFeedItem } from "@/lib/agent/activityFeed";
+import { deriveCompletionSummary } from "@/lib/agent/completionSummary";
+import { deriveProjectIdentity } from "@/lib/agent/projectIdentity";
 import { derivePreviewState } from "@/lib/preview/previewState";
 import { KIND_ICON } from "@/components/workspace/HuddlePanel";
+import { CompletionCard } from "@/components/workspace/CompletionCard";
 import { cn } from "@/lib/cn";
 import { MobilePreviewOverlay } from "@/components/mobile/MobilePreviewOverlay";
 import { MobileCollaboratorsSheet } from "@/components/mobile/MobileCollaboratorsSheet";
 import { MobileShareSettingsSheet } from "@/components/mobile/MobileShareSettingsSheet";
+import { ProposalReviewBanner } from "@/components/workspace/ProposalReviewBanner";
 
 import type { RuntimeHost } from "@/types/session";
 
@@ -54,7 +59,8 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
   const turn = useAgentTurn(sessionId);
   const host = useRuntimeHost(sessionId);
   const presence = usePresence(sessionId);
-  const { checkpoints, restore } = useCheckpoints(sessionId, turn?.active);
+  const { checkpoints, latestPaths, restore } = useCheckpoints(sessionId, turn?.active);
+  const { artifacts } = useArtifacts(sessionId, turn?.active);
   const composer = useHuddleComposer(sessionId, turn);
 
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -67,6 +73,8 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
     [turn]
   );
   const rendered = useMemo(() => groupForMobile(items), [items]);
+  const completion = useMemo(() => deriveCompletionSummary(turn, latestPaths, host), [turn, latestPaths, host]);
+  const identity = deriveProjectIdentity(turn?.taskState);
   const hasOutput = Boolean(host?.previewUrl);
 
   useEffect(() => {
@@ -90,7 +98,10 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
           onClick={() => setSettingsOpen(true)}
           className="flex min-w-0 flex-1 items-center gap-1 rounded-full border border-border bg-bg-raised py-2 pl-3.5 pr-2.5 active:opacity-80"
         >
-          <span className="truncate text-sm font-medium text-fg">{session?.name ?? "Project"}</span>
+          <span className="truncate text-sm font-medium text-fg">
+            {session?.name ?? "Project"}
+            {identity?.progressLabel && <span className="font-normal text-fg-subtle"> · {identity.progressLabel}</span>}
+          </span>
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-fg-subtle" strokeWidth={2} />
         </button>
         <button
@@ -109,6 +120,8 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
         </button>
       </header>
 
+      {session?.isProposal && <ProposalReviewBanner session={session} />}
+
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3">
         {rendered.length === 0 && !hasOutput ? (
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-fg-subtle">
@@ -116,13 +129,21 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
           </div>
         ) : (
           <div className="space-y-0.5">
-            {rendered.map((row, i) =>
-              row.type === "message" ? (
+            {rendered.map((row, i) => {
+              const isLast = i === rendered.length - 1;
+              if (row.type === "activity-group" && isLast && completion && row.entries.length === 1 && row.entries[0].kind === "completed") {
+                return (
+                  <div key={i} className="px-1 py-2">
+                    <CompletionCard summary={completion} />
+                  </div>
+                );
+              }
+              return row.type === "message" ? (
                 <MessageRow key={i} item={row.item} />
               ) : (
                 <ActivityGroupRow key={i} entries={row.entries} isLive={row.isLive} />
-              )
-            )}
+              );
+            })}
           </div>
         )}
 
@@ -214,7 +235,11 @@ export function MobileProjectView({ sessionId }: { sessionId: string }) {
         turnActive={turn?.active ?? false}
         checkpoints={checkpoints}
         onRestoreCheckpoint={restore}
+        artifacts={artifacts}
         onArchived={() => router.push("/")}
+        onProposalCreated={(proposalSessionId) => {
+          window.location.href = `/session/${proposalSessionId}`;
+        }}
       />
     </div>
   );
@@ -247,8 +272,12 @@ function groupForMobile(items: UnifiedFeedItem[]): MobileRow[] {
       rows.push({ type: "message", item });
       continue;
     }
+    // The feed's own trailing "completed" entry always gets its own row,
+    // never merged into the preceding action cluster - Phase 33's
+    // CompletionCard replaces it entirely, and needs it isolated the same
+    // way desktop's HuddlePanel already keeps it as its own list item.
     const last = rows[rows.length - 1];
-    if (last?.type === "activity-group") {
+    if (item.entry.kind !== "completed" && last?.type === "activity-group") {
       last.entries.push(item.entry);
       last.isLive = i === items.length - 1;
     } else {
@@ -285,7 +314,12 @@ function ActivityGroupRow({ entries, isLive }: { entries: ActivityEntry[]; isLiv
   if (entries.length === 1) {
     const entry = entries[0];
     const Icon = KIND_ICON[entry.kind];
-    const isError = entry.kind === "fixing_error" && !entry.ok;
+    const isFailure = entry.kind === "fixing_error" && !entry.ok;
+    // Same Phase 33 STEP 3/8 distinction as desktop's ActivityRow: an
+    // error still live reads as an active problem, one Huddle has
+    // already moved past reads as a handled, historical note.
+    const isActiveFailure = isFailure && isLive;
+    const isPastFailure = isFailure && !isLive;
     return (
       <div className="flex items-center gap-2 rounded-xl px-1 py-2 text-sm">
         {isLive ? (
@@ -294,10 +328,10 @@ function ActivityGroupRow({ entries, isLive }: { entries: ActivityEntry[]; isLiv
           </span>
         ) : (
           <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-bg-raised">
-            <Icon className={cn("h-3 w-3", isError ? "text-danger" : "text-fg-subtle")} strokeWidth={1.75} />
+            <Icon className={cn("h-3 w-3", isActiveFailure ? "text-danger" : isPastFailure ? "text-warning" : "text-fg-subtle")} strokeWidth={1.75} />
           </span>
         )}
-        <span className={cn("truncate", isError ? "text-danger" : "text-fg-subtle")}>{entry.summary}</span>
+        <span className={cn("truncate", isActiveFailure ? "text-danger" : isPastFailure ? "text-warning" : "text-fg-subtle")}>{entry.summary}</span>
       </div>
     );
   }

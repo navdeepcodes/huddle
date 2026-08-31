@@ -173,6 +173,25 @@ body {
   animation: huddle-scan 1.6s ease-in-out infinite;
 }
 
+/* Phase 34: the HuddleMark logo's own two motion moments - a one-time entrance (splash/auth screen) and an optional slow idle breathe (reserved for "Huddle is present/active" contexts, same restraint as ApostleMark-style marks elsewhere - not used on every static render of the mark). */
+@keyframes huddle-mark-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes huddle-mark-breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.035); opacity: 0.88; }
+}
+
+.huddle-animate-mark-in {
+  animation: huddle-mark-in var(--dur-slow) var(--ease-huddle) both;
+}
+
+.huddle-animate-mark-breathe {
+  animation: huddle-mark-breathe 2.6s var(--ease-huddle) infinite;
+}
+
 /* Every animation above degrades to a static, still frame - never a hard "nothing moves" cliff that leaves a half-finished-looking layout, and never a flag any component has to check itself. */
 @media (prefers-reduced-motion: reduce) {
   .huddle-animate-pulse,
@@ -180,7 +199,9 @@ body {
   .huddle-animate-fade-in,
   .huddle-animate-rise-in,
   .huddle-animate-scan,
-  .huddle-animate-sheet-in {
+  .huddle-animate-sheet-in,
+  .huddle-animate-mark-in,
+  .huddle-animate-mark-breathe {
     animation: none;
   }
   .huddle-animate-shimmer {

@@ -20,7 +20,7 @@
  * is spent on one subproblem.
  */
 
-import type { ProjectContract, TaskState, TaskSubgoal } from "@/types/session";
+import type { ProjectContract, ProjectManifest, TaskState, TaskSubgoal } from "@/types/session";
 
 const VALID_STATUSES = new Set<TaskSubgoal["status"]>(["pending", "in_progress", "blocked", "done"]);
 const PROJECT_CONTRACT_FIELDS: Array<keyof ProjectContract> = [
@@ -66,6 +66,51 @@ function parseProjectContract(raw: unknown): { ok: true; value: ProjectContract 
   return { ok: true, value: contract };
 }
 
+/**
+ * Phase 42 §3: unlike projectContract, EVERY field here is individually
+ * optional - the point is a tiny, cheap-to-state plan ("this is a small
+ * website"), not a second required contract the model has to fill out
+ * completely. A malformed shape (wrong type on a field that IS present)
+ * is still rejected, same discipline as the rest of this file - it's
+ * "every field optional," not "anything goes."
+ */
+function parseProjectManifest(raw: unknown): { ok: true; value: ProjectManifest | null } | { ok: false; error: string } {
+  if (raw === undefined) return { ok: true, value: null };
+  if (typeof raw !== "object" || raw === null) {
+    return { ok: false, error: "update_progress's 'manifest', if present, must be an object." };
+  }
+
+  const src = raw as Record<string, unknown>;
+  const manifest: ProjectManifest = {};
+
+  if (src.projectType !== undefined) {
+    if (typeof src.projectType !== "string" || !src.projectType.trim()) {
+      return { ok: false, error: "update_progress's 'manifest.projectType', if present, must be a non-empty string." };
+    }
+    manifest.projectType = src.projectType.trim();
+  }
+  if (src.routes !== undefined) {
+    if (!Array.isArray(src.routes) || src.routes.some((r) => typeof r !== "string")) {
+      return { ok: false, error: "update_progress's 'manifest.routes', if present, must be an array of strings." };
+    }
+    manifest.routes = src.routes as string[];
+  }
+  if (src.targetFiles !== undefined) {
+    if (!Array.isArray(src.targetFiles) || src.targetFiles.some((f) => typeof f !== "string")) {
+      return { ok: false, error: "update_progress's 'manifest.targetFiles', if present, must be an array of strings." };
+    }
+    manifest.targetFiles = src.targetFiles as string[];
+  }
+  if (src.fileBudget !== undefined) {
+    if (typeof src.fileBudget !== "number" || !Number.isFinite(src.fileBudget)) {
+      return { ok: false, error: "update_progress's 'manifest.fileBudget', if present, must be a number." };
+    }
+    manifest.fileBudget = src.fileBudget;
+  }
+
+  return { ok: true, value: Object.keys(manifest).length > 0 ? manifest : null };
+}
+
 /** Never throws - a malformed update_progress call gets a clear rejection message back, same discipline as processWriteFileBatch. */
 export function parseTaskStateUpdate(argumentsJson: string, now: number): ParsedTaskStateUpdate {
   let parsed: unknown;
@@ -79,10 +124,11 @@ export function parseTaskStateUpdate(argumentsJson: string, now: number): Parsed
     return { ok: false, error: "update_progress arguments must be an object." };
   }
 
-  const { objective, subgoals, projectContract } = parsed as {
+  const { objective, subgoals, projectContract, manifest } = parsed as {
     objective?: unknown;
     subgoals?: unknown;
     projectContract?: unknown;
+    manifest?: unknown;
   };
 
   if (typeof objective !== "string" || !objective.trim()) {
@@ -94,6 +140,9 @@ export function parseTaskStateUpdate(argumentsJson: string, now: number): Parsed
 
   const parsedContract = parseProjectContract(projectContract);
   if (!parsedContract.ok) return { ok: false, error: parsedContract.error };
+
+  const parsedManifest = parseProjectManifest(manifest);
+  if (!parsedManifest.ok) return { ok: false, error: parsedManifest.error };
 
   const cleanSubgoals: TaskSubgoal[] = [];
   for (const raw of subgoals) {
@@ -115,6 +164,7 @@ export function parseTaskStateUpdate(argumentsJson: string, now: number): Parsed
       objective: objective.trim(),
       subgoals: cleanSubgoals,
       ...(parsedContract.value ? { projectContract: parsedContract.value } : {}),
+      ...(parsedManifest.value ? { manifest: parsedManifest.value } : {}),
       updatedAt: now,
     },
   };
@@ -227,6 +277,24 @@ export function buildFinishModeNudge(taskState: TaskState | undefined, remaining
 }
 
 /**
+ * Phase 42 §7: injected once, bounded, when several files have been
+ * written this turn but a build has never been attempted - Phase 41C's
+ * own real trace measured 19 files and 14 iterations with zero build
+ * attempts. The prompt already says to build the bare scaffold, then
+ * build again after the first implementation batch (prompt.ts §2,
+ * steps 6/8); this is what fires when that advisory sequence doesn't
+ * get followed on its own. Not a coding instruction - it doesn't say
+ * what's wrong, only that evidence is overdue.
+ */
+export function buildEarlyBuildNudge(fileCount: number): string {
+  return (
+    `${fileCount} files have been written this turn without a single \`npm run build\` yet. ` +
+    `Run the build now, before writing more files - it's a cheap, fast, deterministic check, and finding a real error now costs far less than discovering it after the page is fully built out. ` +
+    `Fix whatever it reports, then continue. Optional sections and polish can wait until after the core page is proven to compile.`
+  );
+}
+
+/**
  * Phase 21: injected once, bounded, when the model declares itself done
  * but the last view_preview call this turn didn't actually succeed -
  * real tool-result evidence, independent of whatever taskState itself
@@ -242,6 +310,92 @@ export function buildBlockingPreviewNudge(taskState: TaskState | undefined): str
     `A build passing or the dev server running isn't the same as the browser actually rendering the requested product - ` +
     `call view_preview again and resolve whatever it reports before declaring this done.`
   );
+}
+
+/**
+ * Phase 39 (Batch 1): injected once, bounded, for a turn whose actual
+ * work this turn is a web project (see loop.ts's isWebProjectTurn) but
+ * lacks one or more of the hard, orchestrator-checked facts a
+ * completion requires - real files, a passed build, a verified
+ * preview. Distinct from buildIncompleteObjectiveNudge (which only
+ * checks the model's own self-reported subgoal status) and
+ * buildBlockingPreviewNudge (which only checks the last view_preview
+ * call) - this is the combined evidence check the orchestrator
+ * ultimately decides completion on, not the model's own claim.
+ */
+export function buildEvidenceNudge(
+  taskState: TaskState | undefined,
+  status: { filesWritten: boolean; buildPassed: boolean; previewVerified: boolean }
+): string {
+  const objectiveLine = taskState?.objective ? ` Your original objective: "${taskState.objective}".` : "";
+  const missing = [
+    !status.filesWritten && "no real project files have been written yet",
+    !status.buildPassed && "the last build attempt this turn hasn't passed (or a build hasn't been run yet)",
+    !status.previewVerified && "the last preview check this turn hasn't actually succeeded",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("; ");
+  return (
+    `Before finishing: this looks like a web project, but ${missing}.${objectiveLine} ` +
+    `Run \`npm run build\` and resolve any errors, then call view_preview and confirm it actually renders, before declaring this done.`
+  );
+}
+
+/**
+ * Phase 41C §7: injected exactly once, at the moment a turn switches
+ * providers mid-flight (e.g. Ultra exhausted its attempt budget,
+ * Lightning is taking over). The rest of the message history already
+ * carries everything the new provider needs - every file written, every
+ * tool result, the full taskState trail - so this doesn't repeat any of
+ * that; it exists only to state the one fact the history can't imply on
+ * its own: a DIFFERENT model is now driving, and it must not mistake
+ * "unfamiliar to me" for "not done yet." Reusing taskState/buildState/
+ * previewState here (not inventing a new summary shape) keeps this
+ * consistent with buildEvidenceNudge's own facts.
+ */
+export function buildProviderTransitionNudge(
+  taskState: TaskState | undefined,
+  status: { buildPassed: boolean; previewVerified: boolean }
+): string {
+  const objectiveLine = taskState?.objective ? ` The original objective: "${taskState.objective}".` : "";
+  const done = taskState?.subgoals.filter((s) => s.status === "done").map((s) => s.description) ?? [];
+  const doneLine = done.length > 0 ? ` Already completed: ${done.join("; ")}.` : "";
+  const evidenceLine = ` Build passed so far: ${status.buildPassed}. Preview verified so far: ${status.previewVerified}.`;
+  return (
+    "You are continuing an existing build after the primary coding provider failed." +
+    objectiveLine +
+    doneLine +
+    evidenceLine +
+    " Do not recreate completed work - inspect the current project state (read_file/list_files) before writing anything, and continue only the remaining task."
+  );
+}
+
+/**
+ * Phase 40 §7: the honest record when a turn hits its hard elapsed-time
+ * ceiling. Deliberately states the ceiling and what was actually
+ * finished, so "it stopped" is never indistinguishable from "it failed"
+ * or from a silent hang - which is exactly what an unbounded turn used
+ * to look like from the outside.
+ */
+export function buildWallClockExhaustedSummary(
+  taskState: TaskState | undefined,
+  budgetMs: number
+): string {
+  const minutes = Math.round(budgetMs / 60_000);
+  const header = `(stopped: this turn hit its ${minutes}-minute time limit and will not start further work)`;
+  if (!taskState) return header;
+
+  const done = taskState.subgoals.filter((s) => s.status === "done").map((s) => s.description);
+  const remaining = taskState.subgoals
+    .filter((s) => s.status !== "done")
+    .map((s) => `${s.description} (${s.status})`);
+
+  return [
+    header,
+    `OBJECTIVE: ${taskState.objective}`,
+    done.length > 0 ? `COMPLETED: ${done.join("; ")}` : "COMPLETED: (nothing finished)",
+    remaining.length > 0 ? `REMAINING: ${remaining.join("; ")}` : "REMAINING: (none tracked)",
+  ].join("\n");
 }
 
 /**

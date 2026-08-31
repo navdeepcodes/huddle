@@ -30,6 +30,8 @@ const KIND_TO_STATUS: Record<ActivityKind, AgentStatus> = {
   inspecting_preview: "inspecting",
   reading: "planning", // low-level orientation, same bucket as planning for status purposes - activityFeed still shows it as its own row
   fixing_error: "fixing",
+  presentation: "writing",
+  image: "writing",
   completed: "completed",
 };
 
@@ -54,7 +56,18 @@ export function deriveAgentStatus(turn: AgentTurn | null): AgentStatusInfo {
 
   if (!turn.active) {
     if (!last) return { status: "idle", label: WORKING_LABEL.idle, detail: null, active: false };
-    const status: AgentStatus = turn.telemetry.terminationReason === "blocked" ? "blocked" : "completed";
+    // Phase 39 (Batch 1): evidence_incomplete and claim_expired both
+    // mean "not a genuine, fully-verified success" - the same UI
+    // treatment as blocked, not a new status vocabulary (see
+    // TERMINATION_LABEL for the more specific human-facing label).
+    const status: AgentStatus =
+      turn.telemetry.terminationReason === "blocked" ||
+      turn.telemetry.terminationReason === "evidence_incomplete" ||
+      turn.telemetry.terminationReason === "claim_expired" ||
+      turn.telemetry.terminationReason === "wall_clock_exhausted" ||
+      turn.telemetry.terminationReason === "build_repair_budget_exhausted"
+        ? "blocked"
+        : "completed";
     return { status, label: WORKING_LABEL[status], detail: last.summary, active: false };
   }
 

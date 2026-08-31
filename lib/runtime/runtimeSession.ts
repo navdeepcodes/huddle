@@ -1,5 +1,6 @@
 import {
   collection,
+  getDocs,
   onSnapshot,
   query,
   where,
@@ -75,6 +76,27 @@ const QUICK_REUSE_CHECK_MS = 5_000;
  * underlying event within a short window.
  */
 const RECONNECT_DEBOUNCE_MS = 2_000;
+
+/**
+ * Phase 41: live-reproduced (2026-08-26) - runtimeCommands docs
+ * confirmed stuck in Firestore forever at status "pending" (queried
+ * directly, not inferred: the exact same query subscribeToCommands
+ * itself runs returned real, un-processed documents on request, so
+ * this isn't a missing-index issue - the query works fine on demand,
+ * the *realtime* onSnapshot channel is what occasionally doesn't fire
+ * for a freshly-created doc). Every observed case was recovered only
+ * because the caller (executeTool.ts) timed out at 130s and the agent
+ * blindly retried the identical command - expensive, and not
+ * guaranteed if a caller ever used a shorter timeout. This poll is a
+ * cheap, standard "trust but verify" fallback for exactly this
+ * transport gap: periodically re-run the same pending-commands query
+ * as a plain one-shot read, not a listener, so it can't share whatever
+ * failure mode silently drops a snapshot callback. processingCommandIds
+ * already dedupes against the realtime listener picking up the same
+ * doc first - whichever path notices it first wins, the other is a
+ * no-op.
+ */
+const COMMAND_RECONCILE_POLL_MS = 5_000;
 
 /**
  * Phase 23: the exact, real error text this session directly observed
@@ -420,6 +442,47 @@ export async function watchForRecovery(
 }
 
 /**
+ * Phase 41: closes a gap distinct from watchForRecovery above -
+ * quickReadinessCheck's own budget (QUICK_PORT_WAIT_MS +
+ * QUICK_READINESS_WAIT_MS, ~23s) is deliberately short, on the
+ * assumption an agent-initiated restart is fast because install is
+ * already done (see its own doc comment) - but the FIRST "npm run dev"
+ * after a build is not that case, and a genuinely cold Tailwind v4/
+ * Next.js compile can still take the same 60-90s PORT_WAIT_MS already
+ * budgets for the automatic boot path. Without this, nothing ever
+ * calls onStateChange again once the quick check gives up:
+ * runtimeHost freezes at "starting" forever, even after the server is
+ * demonstrably answering - live-reproduced (2026-08-26): curl got real
+ * HTML back from the port twice while view_preview kept reading the
+ * same stale "starting" state for 50s at a time, until the agent
+ * worked around it by restarting onto a new port. Called
+ * fire-and-forget from runBackgroundWithReadiness's own "starting"
+ * branch - it doesn't block that call's response, which already
+ * correctly reported "starting"; this only keeps the state doc honest
+ * afterward, the same "fix the state/transition itself" shape as
+ * watchForRecovery. Returns whether it actually promoted to running,
+ * so the caller can update its own lastReadyBackgroundCommand memo.
+ */
+export async function continueWatchingForReadiness(
+  runtime: RuntimeLike,
+  port: number,
+  isStopped: () => boolean,
+  callbacks: RuntimeSessionCallbacks
+): Promise<boolean> {
+  const readiness = await waitForRealResponse(runtime, port, isStopped, PORT_WAIT_MS);
+  if (isStopped() || !readiness.ok) return false;
+  // A newer command may have already superseded this one (another
+  // restart, or the session moved on) - only report readiness for the
+  // port this watch was started for; a stale watch finishing late
+  // should not overwrite fresher state.
+  if (!runtime.getKnownPreviewPorts().includes(port)) return false;
+  const url = await runtime.waitForPort(port);
+  callbacks.onPreviewUrl(url, port);
+  callbacks.onStateChange("running", { port });
+  return true;
+}
+
+/**
  * Client-side orchestrator, one instance per host tab. Implements the
  * approved adjustment: runtime boot and agent BUILD proceed
  * concurrently - boot and the sessionFiles subscription start in the
@@ -447,6 +510,8 @@ export class RuntimeSession {
   private unsubscribeCommands: (() => void) | null = null;
   private processingCommandIds = new Set<string>();
   private callbacks: RuntimeSessionCallbacks | null = null;
+  /** Phase 41: fallback poll for missed onSnapshot deliveries - see COMMAND_RECONCILE_POLL_MS's own doc comment. Started in subscribeToCommands, cleared in stop(). */
+  private commandReconcileTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * Phase 17: the last background command this session confirmed ready,
    * and the port it landed on - lets a repeated identical restart (the
@@ -596,6 +661,15 @@ export class RuntimeSession {
    * live WebContainer to execute against.
    */
   private subscribeToCommands(sessionId: string): void {
+    // Idempotent - reconnectListeners calls this again on top of an
+    // already-running poll (a real, observed path, not hypothetical),
+    // which would otherwise stack a second concurrent interval doing
+    // duplicate reads forever.
+    if (this.commandReconcileTimer) {
+      clearInterval(this.commandReconcileTimer);
+      this.commandReconcileTimer = null;
+    }
+
     this.unsubscribeCommands = subscribeWhenSignedIn(() => {
       const q = query(
         collection(db, "runtimeCommands"),
@@ -623,6 +697,38 @@ export class RuntimeSession {
         }
       );
     });
+
+    // Phase 41: see COMMAND_RECONCILE_POLL_MS's own doc comment - a
+    // plain one-shot read run on a timer, independent of the realtime
+    // listener above, so it can't share whatever transport issue
+    // occasionally drops a snapshot callback for a freshly-created doc.
+    this.commandReconcileTimer = setInterval(() => {
+      void this.pollForMissedCommands(sessionId);
+    }, COMMAND_RECONCILE_POLL_MS);
+  }
+
+  private async pollForMissedCommands(sessionId: string): Promise<void> {
+    if (this.stopped) return;
+    const q = query(
+      collection(db, "runtimeCommands"),
+      where("sessionId", "==", sessionId),
+      where("status", "==", "pending")
+    );
+    let snapshot;
+    try {
+      snapshot = await getDocs(q);
+    } catch {
+      // Same-shaped failure as any other Firestore read going stale -
+      // the next tick tries again; no need for its own recovery path.
+      return;
+    }
+    if (this.stopped) return;
+    for (const doc of snapshot.docs) {
+      const command = doc.data() as RuntimeCommand;
+      if (this.processingCommandIds.has(command.id)) continue;
+      this.processingCommandIds.add(command.id);
+      void this.executeCommand(command);
+    }
   }
 
   /**
@@ -674,6 +780,17 @@ export class RuntimeSession {
       // wait (Phase 17) has an accurate signal to poll instead of
       // whatever stale state preceded this restart.
       this.callbacks?.onStateChange("starting", { port: readiness.port });
+      // Phase 41: keep the state doc honest past the quick check's own
+      // short budget - see continueWatchingForReadiness's own doc
+      // comment for the live-reproduced gap this closes. Fire-and-
+      // forget: doesn't block this call's own response.
+      if (this.callbacks) {
+        void continueWatchingForReadiness(this.runtime, readiness.port, () => this.stopped, this.callbacks).then(
+          (result) => {
+            if (result) this.lastReadyBackgroundCommand = { command: normalized, port: readiness.port as number };
+          }
+        );
+      }
     }
 
     await this.reportCommandResult(commandId, "done", readiness);
@@ -776,6 +893,10 @@ export class RuntimeSession {
     if (this.unhandledRejectionHandler) {
       window.removeEventListener("unhandledrejection", this.unhandledRejectionHandler);
       this.unhandledRejectionHandler = null;
+    }
+    if (this.commandReconcileTimer) {
+      clearInterval(this.commandReconcileTimer);
+      this.commandReconcileTimer = null;
     }
     this.unsubscribeFiles?.();
     this.unsubscribeCommands?.();

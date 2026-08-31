@@ -55,7 +55,14 @@ export const geminiVisionProvider: VisionProvider = {
             },
           ],
         },
-        { timeout: VISION_TIMEOUT_MS, maxRetries: 2 }
+        // Phase 40 §9: bounded retry/fallback is owned by
+        // visionRecovery.ts, not duplicated here - the same rule
+        // qwenVision.ts already states explicitly. This was 2, which
+        // stacked under visionRecovery's own ladder for 6 worst-case
+        // HTTP attempts (~180s) against Qwen's 2 (~120s), for no
+        // articulated reason - the lone outlier among this repo's
+        // providers (geminiImage.ts:97 also uses 0).
+        { timeout: VISION_TIMEOUT_MS, maxRetries: 0 }
       );
 
       const text = completion.choices[0]?.message?.content?.trim();

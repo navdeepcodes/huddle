@@ -150,6 +150,66 @@ describe("parseTaskStateUpdate - projectContract (Phase 18)", () => {
   });
 });
 
+/**
+ * Phase 42 §3: unlike projectContract, every field is individually
+ * optional - the point is a cheap, few-words plan ("this is a small
+ * website"), not a second required contract.
+ */
+describe("parseTaskStateUpdate - manifest (Phase 42)", () => {
+  it("is fine with no manifest at all - fully optional", () => {
+    const result = parseTaskStateUpdate(JSON.stringify({ objective: "x", subgoals: [] }), 1000);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.taskState.manifest).toBeUndefined();
+  });
+
+  it("parses a manifest with only SOME fields present - every field is independently optional", () => {
+    const result = parseTaskStateUpdate(
+      JSON.stringify({ objective: "x", subgoals: [], manifest: { projectType: "marketing_site" } }),
+      1000
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.taskState.manifest).toEqual({ projectType: "marketing_site" });
+  });
+
+  it("parses a manifest with every field present", () => {
+    const manifest = {
+      projectType: "marketing_site",
+      routes: ["/"],
+      targetFiles: ["src/App.jsx", "src/styles.css", "src/main.jsx"],
+      fileBudget: 6,
+    };
+    const result = parseTaskStateUpdate(JSON.stringify({ objective: "x", subgoals: [], manifest }), 1000);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.taskState.manifest).toEqual(manifest);
+  });
+
+  it("rejects a manifest field with the wrong type, without silently ignoring it", () => {
+    const result = parseTaskStateUpdate(
+      JSON.stringify({ objective: "x", subgoals: [], manifest: { routes: "just /, not an array" } }),
+      1000
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects a non-object manifest", () => {
+    const result = parseTaskStateUpdate(
+      JSON.stringify({ objective: "x", subgoals: [], manifest: "a small site" }),
+      1000
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("an empty manifest object is treated the same as no manifest at all", () => {
+    const result = parseTaskStateUpdate(JSON.stringify({ objective: "x", subgoals: [], manifest: {} }), 1000);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.taskState.manifest).toBeUndefined();
+  });
+});
+
 describe("buildIterationSignature", () => {
   it("returns an empty string for no actions", () => {
     expect(buildIterationSignature([])).toBe("");

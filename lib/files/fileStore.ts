@@ -144,6 +144,11 @@ export async function batchWriteSessionFiles(
 
   const batch = adminDb.batch();
   const now = Date.now();
+  // Phase 37: the one place "is this a Project" gets decided - a path outside
+  // artifacts/ is real application code, not a generated artifact. One-way
+  // (never reset false even if that specific file is later deleted - the
+  // session was genuinely worked on as a project at some point).
+  const hasRealFile = files.some((f) => !f.path.startsWith("artifacts/"));
 
   for (const file of files) {
     const ref = adminDb.collection("sessionFiles").doc(fileDocId(sessionId, file.path));
@@ -159,7 +164,10 @@ export async function batchWriteSessionFiles(
     };
     batch.set(ref, doc);
   }
-  batch.update(adminDb.collection("sessions").doc(sessionId), { updatedAt: now });
+  batch.update(adminDb.collection("sessions").doc(sessionId), {
+    updatedAt: now,
+    ...(hasRealFile ? { hasRealFiles: true } : {}),
+  });
 
   await batch.commit();
 }

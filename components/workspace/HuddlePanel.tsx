@@ -15,14 +15,18 @@ import {
   ArrowUp,
   Clock,
   X,
+  Presentation as PresentationIcon,
+  ImageIcon,
 } from "lucide-react";
 
 import { buildUnifiedFeed, type ActivityEntry, type ActivityKind, type UnifiedFeedItem } from "@/lib/agent/activityFeed";
+import { deriveCompletionSummary } from "@/lib/agent/completionSummary";
 import { cn } from "@/lib/cn";
 import { auth } from "@/lib/firebase/client";
 import { buildTeammateLabels, labelForUid } from "@/lib/presence/attribution";
 import { useHuddleComposer } from "@/hooks/useHuddleComposer";
 import { AgentStatusBadge } from "@/components/workspace/AgentStatusBadge";
+import { CompletionCard } from "@/components/workspace/CompletionCard";
 
 import type { AgentTurn, RuntimeHost, Session } from "@/types/session";
 
@@ -34,6 +38,8 @@ export const KIND_ICON: Record<ActivityKind, typeof ListTodo> = {
   inspecting_preview: Eye,
   reading: BookOpen,
   fixing_error: AlertTriangle,
+  presentation: PresentationIcon,
+  image: ImageIcon,
   completed: CheckCircle2,
 };
 
@@ -42,6 +48,8 @@ interface Props {
   session: Session | null;
   turn: AgentTurn | null;
   host: RuntimeHost | null;
+  /** For deriveCompletionSummary's changedFiles - same latestPaths ProjectWorkspace already threads to ChangesSummary, not a second checkpoint fetch. */
+  checkpointPaths: Set<string> | null;
 }
 
 /**
@@ -56,7 +64,7 @@ interface Props {
  * buildUnifiedFeed produces the exact same pre-summarized activity
  * entries buildActivityFeed always did.
  */
-export function HuddlePanel({ sessionId, session, turn, host }: Props) {
+export function HuddlePanel({ sessionId, session, turn, host, checkpointPaths }: Props) {
   const { followUp, setFollowUp, sending, sendError, setSendError, queued, sendFollowUp, cancelTurn, editQueued, discardQueued } =
     useHuddleComposer(sessionId, turn);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -68,6 +76,7 @@ export function HuddlePanel({ sessionId, session, turn, host }: Props) {
     () => (turn ? buildUnifiedFeed(turn.log, { active: turn.active, terminationReason: turn.telemetry.terminationReason }) : []),
     [turn]
   );
+  const completion = useMemo(() => deriveCompletionSummary(turn, checkpointPaths, host), [turn, checkpointPaths, host]);
 
   // Keeps the thread pinned to the latest entry as Huddle works - the
   // one thing a stacked activity-then-chat layout never needed, since
@@ -103,15 +112,28 @@ export function HuddlePanel({ sessionId, session, turn, host }: Props) {
           )
         ) : (
           <ul>
-            {items.map((item, i) => (
-              <FeedRow
-                key={i}
-                item={item}
-                isLast={i === items.length - 1}
-                isLive={turn?.active === true && i === items.length - 1}
-                selfLabel={item.type === "message" && item.role === "user" ? labelForUid(item.uid, selfUid, teammateLabels) : undefined}
-              />
-            ))}
+            {items.map((item, i) => {
+              const isLast = i === items.length - 1;
+              // The unified feed's own final "completed" row is replaced with the richer,
+              // evidence-backed CompletionCard (Phase 33 STEP 4) - same underlying event,
+              // just not rendered as a plain activity summary anymore.
+              if (isLast && completion && item.type === "activity" && item.entry.kind === "completed") {
+                return (
+                  <li key={i} className="huddle-animate-rise-in px-2 py-1.5">
+                    <CompletionCard summary={completion} />
+                  </li>
+                );
+              }
+              return (
+                <FeedRow
+                  key={i}
+                  item={item}
+                  isLast={isLast}
+                  isLive={turn?.active === true && isLast}
+                  selfLabel={item.type === "message" && item.role === "user" ? labelForUid(item.uid, selfUid, teammateLabels) : undefined}
+                />
+              );
+            })}
           </ul>
         )}
       </div>
@@ -221,7 +243,13 @@ export function FeedRow({
 function ActivityRow({ entry, isLast, isLive }: { entry: ActivityEntry; isLast: boolean; isLive: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const Icon = KIND_ICON[entry.kind];
-  const isError = entry.kind === "fixing_error" && !entry.ok;
+  const isFailure = entry.kind === "fixing_error" && !entry.ok;
+  // Phase 33 STEP 3/8: an error still at the top of the timeline (isLast, mid-turn) reads as
+  // an active problem - danger red. The same error once Huddle has moved past it (superseded by
+  // later activity) reads as a handled, historical note - a milder warning tone, not a standing
+  // alarm for something already resolved.
+  const isActiveFailure = isFailure && isLast;
+  const isPastFailure = isFailure && !isLast;
   const expandable = entry.detail.length > 1;
 
   return (
@@ -233,7 +261,10 @@ function ActivityRow({ entry, isLast, isLive }: { entry: ActivityEntry; isLast: 
           <span className="huddle-animate-pulse h-1.5 w-1.5 rounded-full bg-accent" />
         ) : (
           <Icon
-            className={cn("h-3.5 w-3.5", isError ? "text-danger" : entry.kind === "completed" ? "text-success" : "text-fg-subtle")}
+            className={cn(
+              "h-3.5 w-3.5",
+              isActiveFailure ? "text-danger" : isPastFailure ? "text-warning" : entry.kind === "completed" ? "text-success" : "text-fg-subtle"
+            )}
             strokeWidth={1.75}
           />
         )}
@@ -245,7 +276,7 @@ function ActivityRow({ entry, isLast, isLive }: { entry: ActivityEntry; isLast: 
           disabled={!expandable}
           className={cn(
             "flex w-full items-center gap-1 text-left",
-            isError ? "text-danger" : entry.kind === "completed" ? "text-fg" : "text-fg-muted"
+            isActiveFailure ? "text-danger" : isPastFailure ? "text-warning" : entry.kind === "completed" ? "text-fg" : "text-fg-muted"
           )}
         >
           <span className="min-w-0 flex-1 truncate">{entry.summary}</span>

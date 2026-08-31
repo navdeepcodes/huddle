@@ -87,3 +87,80 @@ export function validateWriteFileArgs(args: unknown): WriteFileValidationResult 
 
   return { ok: true, value: { path: pathResult.path, content: record.content } };
 }
+
+export type WriteFileCallValidationResult =
+  | { ok: true; files: WriteFileArgs[] }
+  | WriteFileValidationError;
+
+/**
+ * Phase 39 (Batch 1 follow-up, "file explosion" fix): a single
+ * write_file CALL can now describe one file (the original `path`/
+ * `content` shortcut, unchanged and still fully valid) or several
+ * (`files: [{path, content}, ...]`). Root cause this exists to close:
+ * live evidence across every build tonight showed the model reliably
+ * writing exactly one file per turn even with `parallel_tool_calls:
+ * true` already enabled at the provider layer and explicit prompt
+ * guidance to batch - the model simply never emits more than one
+ * `write_file` tool_call in a single response. A model producing one
+ * larger JSON payload (several files inside ONE call's arguments) is
+ * a much more ordinary capability than emitting several parallel
+ * function calls, so this reframes "batch your writes" as a schema
+ * affordance instead of relying on provider-native parallel tool
+ * calls the model isn't using.
+ *
+ * Deliberately whole-call-or-nothing, same discipline as the original
+ * single-file validator: a `files` array with even one malformed entry
+ * rejects the WHOLE call (not a partial batch) - a model that gets
+ * this wrong needs a clear, unambiguous signal to retry the call
+ * correctly, not a confusing mix of some-files-written/some-not from
+ * one tool_call_id.
+ */
+export function validateWriteFileCallArgs(args: unknown): WriteFileCallValidationResult {
+  if (typeof args !== "object" || args === null) {
+    return invalid("path", "write_file arguments were not a JSON object.");
+  }
+
+  const record = args as Record<string, unknown>;
+
+  if (record.files !== undefined) {
+    let filesValue = record.files;
+    // Live-confirmed model quirk (2026-08-26, first real build under this
+    // feature): a model can double-encode a nested argument - emitting
+    // `"files": "[{...}, {...}]"` (a JSON array serialized AGAIN into a
+    // string) instead of a real array. Parsed defensively here rather
+    // than rejected outright, since this is a well-understood, common
+    // tool-calling quirk (not a sign the model's intent was wrong) and
+    // costs a full wasted round-trip to recover from otherwise. Only
+    // ever a fallback - a genuine array (the normal case) never reaches
+    // this branch.
+    if (typeof filesValue === "string") {
+      try {
+        const parsed = JSON.parse(filesValue);
+        if (Array.isArray(parsed)) filesValue = parsed;
+      } catch {
+        // Not valid JSON either - falls through to the "not an array" rejection below, unchanged.
+      }
+    }
+
+    if (!Array.isArray(filesValue)) {
+      return invalid("path", "write_file's 'files' argument, if present, must be an array of {path, content} objects.");
+    }
+    if (filesValue.length === 0) {
+      return invalid("path", "write_file's 'files' array must contain at least one file - omit 'files' entirely and use 'path'/'content' for a single file instead.");
+    }
+
+    const files: WriteFileArgs[] = [];
+    for (const entry of filesValue) {
+      const single = validateWriteFileArgs(entry);
+      if (!single.ok) return single;
+      files.push(single.value);
+    }
+    return { ok: true, files };
+  }
+
+  // No 'files' array - fall back to the original single-file shape,
+  // unchanged behavior (including its exact error messages/fields).
+  const single = validateWriteFileArgs(record);
+  if (!single.ok) return single;
+  return { ok: true, files: [single.value] };
+}
